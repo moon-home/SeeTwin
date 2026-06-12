@@ -22,7 +22,7 @@ from typing import Optional
 
 import gradio as gr
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +131,7 @@ def handle_upload(file_path: str, slot_idx: int, session: dict) -> tuple:
     if file_path is None:
         return session, None, _status_text(session)
 
-    image = Image.open(file_path).convert("RGB")
+    image = ImageOps.exif_transpose(Image.open(file_path)).convert("RGB")
     image = resize_to_max(image, MAX_PX)
 
     session["images"][slot_idx] = image
