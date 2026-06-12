@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(log show *)",
+      "Bash(ioreg *)",
+      "Bash(launchctl list *)",
+      "Bash(launchctl print *)",
+      "Bash(curl *)"
+    ]
+  }
+}
