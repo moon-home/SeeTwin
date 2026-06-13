@@ -28,9 +28,9 @@ def parse_args():
 
 
 def build_app(device: str = "cpu") -> gr.Blocks:
-    from ui.stage1_ui import build_stage1_tab
+    from ui.stage1_ui import build_stage1_tab, STAGE1_JS
 
-    with gr.Blocks(title="SeeTwin", theme=gr.themes.Soft()) as app:
+    with gr.Blocks(title="SeeTwin", theme=gr.themes.Soft(), js=STAGE1_JS) as app:
         gr.Markdown(
             "# SeeTwin\n"
             "Photo-to-rigged 3D avatar pipeline · "

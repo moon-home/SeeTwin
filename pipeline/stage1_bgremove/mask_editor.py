@@ -160,8 +160,8 @@ def _feather(mask: np.ndarray, radius: int) -> np.ndarray:
 def overlay_strokes(
     image_rgba: Image.Image,
     strokes: StrokeLayer,
-    fg_color: tuple = (30, 200, 120, 60),   # semi-transparent green
-    bg_color: tuple = (220, 60, 60, 60),     # semi-transparent red
+    fg_color: tuple = (30, 200, 120, 160),   # green, 63% opacity
+    bg_color: tuple = (220, 60, 60, 160),     # red, 63% opacity
 ) -> Image.Image:
     """
     Overlay stroke regions on an RGBA image for display in the canvas.

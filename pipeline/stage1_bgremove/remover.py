@@ -43,7 +43,7 @@ def _load_model(device: str = "cpu"):
     logger.info("Loading BRIA-RMBG-2.0 model (first load may take a minute)...")
 
     _model = AutoModelForImageSegmentation.from_pretrained(
-        "briaai/BRIA-RMBG-2.0",
+        "briaai/RMBG-2.0",
         trust_remote_code=True,
     )
     _model.to(device)

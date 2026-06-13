@@ -1,22 +1,8 @@
-"""
-Stage 1 — Background removal UI (Gradio).
-
-Layout:
-  Left col  — upload slots for 3 photos (front, side, back)
-  Centre    — canvas showing active photo with mask preview and stroke overlay
-  Right col — brush mode, brush size, threshold slider, feather slider, actions
-
-State that lives in Gradio:
-  - Uploaded PIL images (3 slots)
-  - Raw model alpha masks (3 floats arrays, one per photo)
-  - StrokeLayer per photo (brush corrections)
-  - Active photo index (0 = front, 1 = side, 2 = back)
-  - Current threshold and feather values
-"""
+"""Stage 1 — Background removal UI (Gradio)."""
 
 from __future__ import annotations
 
-import io
+import json
 import logging
 from typing import Optional
 
@@ -31,370 +17,484 @@ from pipeline.stage1_bgremove import (
     apply_alpha_to_image,
     composite_on_checker,
     merge,
-    overlay_strokes,
     resize_to_max,
     run_model,
 )
 
 MAX_PX = 1024
 PHOTO_LABELS = ["Front", "Side", "Back"]
-BRUSH_SIZES = [8, 16, 24, 36]  # pixel radii
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_FEATHER = 2
 
+# ---------------------------------------------------------------------------
+# Injected JS — transparent canvas overlay for real-time brush painting.
+# Strokes accumulate in window.seetwin_strokes and are synced to a hidden
+# Gradio Textbox so Python can read them on the next button click.
+# The MutationObserver auto-clears the overlay whenever the canvas image
+# src changes (i.e. after any Python handler updates the canvas).
+# ---------------------------------------------------------------------------
+STAGE1_JS = """() => {
+  var overlay = null, painting = false;
+  window.seetwin_strokes = [];
+
+  function getContainer() {
+    return document.querySelector('#seetwin-canvas');
+  }
+
+  /* Find natural image dimensions — only used for coordinate scaling.
+     We walk up from the container to find the first img with real pixels. */
+  function getNatDims() {
+    var c = getContainer();
+    if (!c) return null;
+    var el = c;
+    for (var depth = 0; depth < 6; depth++) {
+      var imgs = el.querySelectorAll('img');
+      for (var i = 0; i < imgs.length; i++) {
+        if (imgs[i].naturalWidth > 10) {
+          return { w: imgs[i].naturalWidth, h: imgs[i].naturalHeight,
+                   img: imgs[i] };
+        }
+      }
+      if (!el.parentElement || el.tagName === 'BODY') break;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  /* Visual rect of the photo within the container, using the container's
+     own bounding rect (always reliable) plus the natural image aspect ratio
+     to compute letterbox offsets. */
+  function getVisualRect() {
+    var c = getContainer();
+    if (!c) return null;
+    var cRect = c.getBoundingClientRect();
+    if (!cRect.width || !cRect.height) return null;
+    var nd = getNatDims();
+    if (!nd) return null;
+    var natR = nd.w / nd.h, cR = cRect.width / cRect.height;
+    var dispW, dispH, offX, offY;
+    if (natR > cR) {
+      dispW = cRect.width;  dispH = cRect.width  / natR;
+      offX  = 0;            offY  = (cRect.height - dispH) / 2;
+    } else {
+      dispH = cRect.height; dispW = cRect.height * natR;
+      offY  = 0;            offX  = (cRect.width  - dispW) / 2;
+    }
+    var top  = cRect.top  + offY;
+    var left = cRect.left + offX;
+    return { top: top, left: left, right: left + dispW, bottom: top + dispH,
+             width: dispW, height: dispH, natW: nd.w, natH: nd.h,
+             img: nd.img };
+  }
+
+  function getBrushRadius() {
+    var el = document.querySelector('#seetwin-radius input[type=range]');
+    return el ? parseFloat(el.value) : 24;
+  }
+  function getBrushMode() {
+    var rs = document.querySelectorAll('#seetwin-mode input[type=radio]');
+    for (var i = 0; i < rs.length; i++) {
+      if (rs[i].checked) {
+        var lbl = rs[i].closest('label');
+        var txt = lbl ? (lbl.textContent || lbl.innerText) : '';
+        return txt.toLowerCase().indexOf('keep') >= 0 ? 'fg' : 'bg';
+      }
+    }
+    return 'bg';
+  }
+
+  function setupOverlay() {
+    var c = getContainer();
+    if (!c) { setTimeout(setupOverlay, 600); return; }
+    var cRect = c.getBoundingClientRect();
+    if (!cRect.width) { setTimeout(setupOverlay, 600); return; }
+    var nd = getNatDims();
+    if (!nd) { setTimeout(setupOverlay, 600); return; }
+
+    if (overlay) { overlay.remove(); overlay = null; }
+
+    overlay = document.createElement('canvas');
+    overlay.id = 'seetwin-overlay';
+    overlay.style.cssText = (
+      'position:fixed;z-index:9999;pointer-events:none;' +
+      'top:'    + cRect.top    + 'px;' +
+      'left:'   + cRect.left   + 'px;' +
+      'width:'  + cRect.width  + 'px;' +
+      'height:' + cRect.height + 'px;'
+    );
+    overlay.width  = nd.w;
+    overlay.height = nd.h;
+    document.body.appendChild(overlay);
+
+    nd.img.draggable = false;
+  }
+
+  function repositionOverlay() {
+    if (!overlay) return;
+    var c = getContainer();
+    if (!c) return;
+    var cRect = c.getBoundingClientRect();
+    overlay.style.top    = cRect.top    + 'px';
+    overlay.style.left   = cRect.left   + 'px';
+    overlay.style.width  = cRect.width  + 'px';
+    overlay.style.height = cRect.height + 'px';
+  }
+  window.addEventListener('scroll', repositionOverlay, true);
+  window.addEventListener('resize', repositionOverlay);
+
+  /* Capture-phase listeners — fire before any Gradio handler. */
+  document.addEventListener('mousedown', function (e) {
+    var r = getVisualRect();
+    if (!r || e.clientX < r.left || e.clientX > r.right ||
+               e.clientY < r.top  || e.clientY > r.bottom) return;
+    e.preventDefault();
+    e.stopPropagation();
+    painting = true;
+    paint(e);
+  }, true);
+
+  document.addEventListener('mousemove', function (e) {
+    if (painting) paint(e);
+  });
+
+  document.addEventListener('mouseup', function () {
+    if (painting) { painting = false; syncBox(); }
+  });
+
+  function paint(e) {
+    var r = getVisualRect();
+    if (!r) return;
+    var sx = r.natW / r.width;
+    var sy = r.natH / r.height;
+    var x  = Math.round((e.clientX - r.left) * sx);
+    var y  = Math.round((e.clientY - r.top)  * sy);
+    if (x < 0 || y < 0 || x >= r.natW || y >= r.natH) return;
+    var br   = Math.round(getBrushRadius());
+    var mode = getBrushMode();
+
+    /* Always record — strokes reach Python even if overlay is missing */
+    window.seetwin_strokes.push({ x: x, y: y, r: br, mode: mode });
+
+    /* Draw visually only if overlay canvas exists */
+    if (overlay) {
+      var color = (mode === 'fg') ? '#1EC878' : '#DC3C3C';
+      var ctx = overlay.getContext('2d');
+      ctx.globalAlpha = 0.65;
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(x, y, br, 0, 2 * Math.PI); ctx.fill();
+    }
+  }
+
+  function syncBox() {
+    var tb = document.querySelector('#seetwin-strokes-box textarea');
+    if (!tb) return;
+    var setter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(tb, JSON.stringify(window.seetwin_strokes));
+    tb.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  window.seetwin_clear = function () {
+    window.seetwin_strokes = [];
+    if (overlay) {
+      overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+    }
+    syncBox();
+  };
+
+  /* Watch only the img's src attribute — avoids firing on every Gradio
+     internal DOM update that would destroy/recreate the overlay in a loop. */
+  function startWatcher() {
+    var imgs = document.querySelectorAll('#seetwin-canvas img');
+    if (!imgs.length) { setTimeout(startWatcher, 500); return; }
+    new MutationObserver(function () {
+      if (overlay) { overlay.remove(); overlay = null; }
+      setTimeout(setupOverlay, 400);
+    }).observe(imgs[0], { attributes: true, attributeFilter: ['src'] });
+  }
+
+  setTimeout(setupOverlay, 1500);
+  setTimeout(startWatcher,  1500);
+}
+"""
+
+_STYLE = """<style>
+.st1-label { font-size: 0.78rem; color: #aaa; text-transform: uppercase;
+             letter-spacing: .05em; margin: 8px 0 2px; }
+#seetwin-mode label:first-of-type span { color: #1EC878 !important; font-weight: 600; }
+#seetwin-mode label:last-of-type  span { color: #DC3C3C !important; font-weight: 600; }
+/* Crosshair cursor + no native drag on the canvas image */
+#seetwin-canvas img, #seetwin-canvas ~ * img { cursor: crosshair !important; }
+#seetwin-canvas img { -webkit-user-drag: none; user-drag: none; }
+</style>"""
+
 
 # ---------------------------------------------------------------------------
-# Session state helpers
+# Session helpers
 # ---------------------------------------------------------------------------
 
 def _empty_session() -> dict:
-    return {
-        "images": [None, None, None],       # PIL Image per slot
-        "alpha_masks": [None, None, None],  # float32 ndarray per slot
-        "strokes": [None, None, None],      # StrokeLayer per slot
-        "active": 0,                        # currently viewed photo index
-    }
+    return {"images": [None]*3, "alpha_masks": [None]*3,
+            "strokes": [None]*3, "active": 0}
 
-
-def _get_strokes(session: dict, idx: int) -> Optional[StrokeLayer]:
-    return session["strokes"][idx]
-
-
-def _ensure_strokes(session: dict, idx: int) -> StrokeLayer:
+def _ensure_strokes(session, idx):
     if session["strokes"][idx] is None and session["images"][idx] is not None:
         img = session["images"][idx]
         session["strokes"][idx] = StrokeLayer(img.height, img.width)
     return session["strokes"][idx]
 
-
-# ---------------------------------------------------------------------------
-# Canvas rendering
-# ---------------------------------------------------------------------------
-
-def _render_canvas(session: dict, threshold: float, feather: int) -> Optional[Image.Image]:
-    """
-    Produce the canvas image for the active photo slot.
-    Shows the original image composited on a checkerboard with stroke overlay.
-    """
+def _apply_json_strokes(strokes_json: str, session: dict) -> None:
+    try:
+        items = json.loads(strokes_json or "[]")
+    except Exception:
+        return
+    if not items:
+        return
     idx = session["active"]
-    image = session["images"][idx]
-    alpha = session["alpha_masks"][idx]
+    if session["images"][idx] is None:
+        return
+    sl = _ensure_strokes(session, idx)
+    for s in items:
+        sl.paint(int(s["x"]), int(s["y"]), radius=int(s["r"]), mode=s["mode"])
+    logger.info("Applied %d JS strokes to slot %d", len(items), idx)
+
+
+# ---------------------------------------------------------------------------
+# Canvas rendering  (no Python-side stroke overlay — JS handles that)
+# ---------------------------------------------------------------------------
+
+def _render_canvas(session, threshold, feather) -> Optional[Image.Image]:
+    idx    = session["active"]
+    image  = session["images"][idx]
+    alpha  = session["alpha_masks"][idx]
     strokes = session["strokes"][idx]
 
     if image is None:
         return None
 
     if alpha is None:
-        # Model hasn't run yet — show original on checkerboard
-        return composite_on_checker(image.convert("RGBA"))
-
-    # Build final mask
-    sl = strokes if strokes is not None else StrokeLayer(image.height, image.width)
-    final_mask = merge(alpha, sl, threshold=threshold, feather_px=feather)
-
-    # Composite with transparency
-    rgba = apply_alpha_to_image(image, final_mask)
-
-    # Overlay stroke visualisation
-    if strokes is not None and not strokes.is_empty():
-        rgba = overlay_strokes(rgba, strokes)
-
-    return composite_on_checker(rgba)
-
-
-def _status_text(session: dict) -> str:
-    idx = session["active"]
-    alpha = session["alpha_masks"][idx]
-    strokes = session["strokes"][idx]
-
-    if alpha is None:
-        return "Upload a photo and click **Run model**"
-
-    stroke_px = strokes.stroke_count() if strokes else 0
-    parts = [f"Photo: {PHOTO_LABELS[idx]}"]
-    if stroke_px > 0:
-        parts.append(f"{stroke_px:,} painted pixels")
+        # Before model runs: treat full image as foreground, apply any strokes
+        base = np.ones((image.height, image.width), dtype=np.float32)
+        sl   = strokes or StrokeLayer(image.height, image.width)
+        mask = merge(base, sl, threshold=0.5, feather_px=0)
     else:
-        parts.append("No corrections yet")
+        sl   = strokes or StrokeLayer(image.height, image.width)
+        mask = merge(alpha, sl, threshold=threshold, feather_px=feather)
 
-    ready = all(session["alpha_masks"])
-    parts.append("✓ All 3 photos ready" if ready else "Waiting for all 3 photos")
+    return composite_on_checker(apply_alpha_to_image(image, mask))
+
+def _status(session) -> str:
+    idx     = session["active"]
+    alpha   = session["alpha_masks"][idx]
+    strokes = session["strokes"][idx]
+    if alpha is None:
+        return "Paint then click **Apply strokes** — or run the model first"
+    px = strokes.stroke_count() if strokes else 0
+    parts = [f"Photo: {PHOTO_LABELS[idx]}",
+             f"{px:,} stroke px" if px else "no corrections"]
+    ready = all(m is not None for m in session["alpha_masks"])
+    parts.append("✓ all 3 ready" if ready else "waiting for all 3")
     return " · ".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Event handlers
+# Handlers
 # ---------------------------------------------------------------------------
 
-def handle_upload(file_path: str, slot_idx: int, session: dict) -> tuple:
-    """Handle photo upload for a given slot."""
-    if file_path is None:
-        return session, None, _status_text(session)
+def handle_upload(path, slot, session, threshold, feather):
+    if path is None:
+        return session, _render_canvas(session, threshold, feather), _status(session)
+    img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    img = resize_to_max(img, MAX_PX)
+    session["images"][slot]      = img
+    session["alpha_masks"][slot] = None
+    session["strokes"][slot]     = None
+    session["active"]            = slot
+    return session, _render_canvas(session, threshold, feather), _status(session)
 
-    image = ImageOps.exif_transpose(Image.open(file_path)).convert("RGB")
-    image = resize_to_max(image, MAX_PX)
-
-    session["images"][slot_idx] = image
-    session["alpha_masks"][slot_idx] = None  # reset mask on new upload
-    session["strokes"][slot_idx] = None
-    session["active"] = slot_idx
-
-    canvas = _render_canvas(session, DEFAULT_THRESHOLD, DEFAULT_FEATHER)
-    return session, canvas, _status_text(session)
-
-
-def handle_run_model(session: dict, threshold: float, feather: int, device: str) -> tuple:
-    """Run the model on the currently active photo."""
+def handle_run_model(strokes_json, session, threshold, feather, device):
+    _apply_json_strokes(strokes_json, session)
     idx = session["active"]
-    image = session["images"][idx]
-
-    if image is None:
-        return session, None, "No photo loaded for this slot."
-
-    logger.info(f"Running model on {PHOTO_LABELS[idx]} photo...")
-    alpha = run_model(image, device=device)
-    session["alpha_masks"][idx] = alpha
-
-    # Preserve existing strokes — don't reset them on re-run
+    if session["images"][idx] is None:
+        return session, _render_canvas(session, threshold, feather), "No photo loaded."
+    logger.info("Running model on %s…", PHOTO_LABELS[idx])
+    session["alpha_masks"][idx] = run_model(session["images"][idx], device=device)
     _ensure_strokes(session, idx)
+    return session, _render_canvas(session, threshold, feather), _status(session)
 
-    canvas = _render_canvas(session, threshold, feather)
-    return session, canvas, _status_text(session)
-
-
-def handle_run_all(session: dict, threshold: float, feather: int, device: str) -> tuple:
-    """Run the model on all uploaded photos sequentially."""
+def handle_run_all(strokes_json, session, threshold, feather, device):
+    _apply_json_strokes(strokes_json, session)
     for idx in range(3):
         if session["images"][idx] is not None:
             session["active"] = idx
-            alpha = run_model(session["images"][idx], device=device)
-            session["alpha_masks"][idx] = alpha
+            session["alpha_masks"][idx] = run_model(session["images"][idx], device=device)
             _ensure_strokes(session, idx)
+    return session, _render_canvas(session, threshold, feather), _status(session)
 
-    canvas = _render_canvas(session, threshold, feather)
-    return session, canvas, _status_text(session)
+def handle_apply(strokes_json, session, threshold, feather):
+    _apply_json_strokes(strokes_json, session)
+    return session, _render_canvas(session, threshold, feather), _status(session)
 
-
-def handle_paint(
-    session: dict,
-    evt: gr.SelectData,
-    brush_mode: str,
-    brush_size: int,
-    threshold: float,
-    feather: int,
-) -> tuple:
-    """
-    Handle a click/drag on the canvas image.
-    Gradio SelectData gives us the pixel coordinates of the click.
-    """
+def handle_clear(session, threshold, feather):
     idx = session["active"]
-    if session["images"][idx] is None or session["alpha_masks"][idx] is None:
-        return session, _render_canvas(session, threshold, feather)
+    if session["strokes"][idx]:
+        session["strokes"][idx].clear()
+    return session, _render_canvas(session, threshold, feather), _status(session)
 
-    strokes = _ensure_strokes(session, idx)
-    # evt.index is (x, y) for Image components
-    cx, cy = int(evt.index[0]), int(evt.index[1])
-    strokes.paint(cx, cy, radius=brush_size, mode=brush_mode)
+def handle_switch(strokes_json, session, slot, threshold, feather):
+    _apply_json_strokes(strokes_json, session)
+    session["active"] = slot
+    return session, _render_canvas(session, threshold, feather), _status(session)
 
-    canvas = _render_canvas(session, threshold, feather)
-    return session, canvas
-
-
-def handle_clear_strokes(session: dict, threshold: float, feather: int) -> tuple:
-    idx = session["active"]
-    strokes = session["strokes"][idx]
-    if strokes is not None:
-        strokes.clear()
-    canvas = _render_canvas(session, threshold, feather)
-    return session, canvas, _status_text(session)
-
-
-def handle_switch_photo(session: dict, slot_idx: int, threshold: float, feather: int) -> tuple:
-    session["active"] = slot_idx
-    canvas = _render_canvas(session, threshold, feather)
-    return session, canvas, _status_text(session)
-
-
-def handle_threshold_change(session: dict, threshold: float, feather: int) -> Image.Image:
+def handle_threshold(session, threshold, feather):
     return _render_canvas(session, threshold, feather)
 
-
-def handle_export(session: dict, threshold: float, feather: int) -> list[str]:
-    """Export all completed photos as PNG files with transparency."""
+def handle_export(session, threshold, feather):
+    import tempfile
     paths = []
-    import tempfile, os
-
     for idx in range(3):
-        image = session["images"][idx]
+        img   = session["images"][idx]
         alpha = session["alpha_masks"][idx]
-        if image is None or alpha is None:
+        if img is None or alpha is None:
             continue
-
-        strokes = session["strokes"][idx] or StrokeLayer(image.height, image.width)
-        final_mask = merge(alpha, strokes, threshold=threshold, feather_px=feather)
-        rgba = apply_alpha_to_image(image, final_mask)
-
+        sl   = session["strokes"][idx] or StrokeLayer(img.height, img.width)
+        mask = merge(alpha, sl, threshold=threshold, feather_px=feather)
+        rgba = apply_alpha_to_image(img, mask)
         with tempfile.NamedTemporaryFile(
-            suffix=f"_seetwin_{PHOTO_LABELS[idx].lower()}.png",
-            delete=False
-        ) as f:
-            rgba.save(f.name, format="PNG")
+                suffix=f"_seetwin_{PHOTO_LABELS[idx].lower()}.png", delete=False) as f:
+            rgba.save(f.name, "PNG")
             paths.append(f.name)
-
     return paths
 
 
 # ---------------------------------------------------------------------------
-# Build the Gradio tab
+# UI
 # ---------------------------------------------------------------------------
 
 def build_stage1_tab(device: str = "cpu") -> gr.Tab:
-    """
-    Returns a gr.Tab component containing the full Stage 1 UI.
-    Call this from app.py and mount it in a gr.Blocks + gr.Tabs context.
-    """
-
     with gr.Tab("1 — Background removal") as tab:
         session_state = gr.State(_empty_session())
 
+        # Inject CSS only — JS runs via gr.Blocks(js=STAGE1_JS) in app.py
+        gr.HTML(_STYLE)
+
         with gr.Row():
-            # ── Left column: uploads ────────────────────────────────────────
+            # ── Left: uploads ───────────────────────────────────────────────
             with gr.Column(scale=2, min_width=200):
                 gr.Markdown("### Input photos")
-                upload_front = gr.File(
-                    label="Front (T-pose)", file_types=["image"], type="filepath"
-                )
-                upload_side = gr.File(
-                    label="Side (T-pose)", file_types=["image"], type="filepath"
-                )
-                upload_back = gr.File(
-                    label="Back (T-pose)", file_types=["image"], type="filepath"
-                )
-
-                gr.Markdown("**Active photo**")
+                upload_front = gr.File(label="Front (T-pose)", file_types=["image"], type="filepath")
+                upload_side  = gr.File(label="Side (T-pose)",  file_types=["image"], type="filepath")
+                upload_back  = gr.File(label="Back (T-pose)",  file_types=["image"], type="filepath")
+                gr.HTML('<p class="st1-label">Active photo</p>')
                 with gr.Row():
                     btn_front = gr.Button("Front", size="sm")
                     btn_side  = gr.Button("Side",  size="sm")
                     btn_back  = gr.Button("Back",  size="sm")
 
-            # ── Centre: canvas ───────────────────────────────────────────────
+            # ── Centre: canvas only ──────────────────────────────────────────
             with gr.Column(scale=5):
                 canvas = gr.Image(
-                    label="Canvas (click to paint)",
-                    type="pil",
+                    label="Canvas",
                     interactive=False,
+                    type="pil",
                     height=520,
+                    show_download_button=False,
+                    elem_id="seetwin-canvas",
+                )
+                # Hidden textbox — JS writes stroke JSON here on each stroke end
+                strokes_box = gr.Textbox(
+                    value="[]", visible=False, elem_id="seetwin-strokes-box"
                 )
 
-            # ── Right column: tools ─────────────────────────────────────────
+            # ── Right: brush + sliders + actions ────────────────────────────
             with gr.Column(scale=2, min_width=180):
-                gr.Markdown("### Brush mode")
-                brush_mode = gr.Radio(
-                    choices=["fg", "bg"],
-                    value="fg",
+                gr.HTML('<p class="st1-label">Brush mode</p>')
+                mode_radio = gr.Radio(
+                    choices=["🟢 Keep", "🔴 Remove"],
+                    value="🔴 Remove",
                     label="",
-                    info="fg = keep (green)  ·  bg = remove (red)",
+                    elem_id="seetwin-mode",
+                    interactive=True,
                 )
-
-                gr.Markdown("### Brush size")
-                brush_size = gr.Slider(
-                    minimum=4, maximum=60, value=16, step=4, label="Radius (px)"
+                gr.HTML('<p class="st1-label">Brush radius (px)</p>')
+                brush_slider = gr.Slider(
+                    8, 80, value=24, step=4,
+                    label="",
+                    elem_id="seetwin-radius",
+                    interactive=True,
                 )
-
-                gr.Markdown("### Threshold")
-                threshold = gr.Slider(
-                    minimum=0.0, maximum=1.0, value=DEFAULT_THRESHOLD,
-                    step=0.01, label="Edge confidence cutoff"
-                )
-
-                gr.Markdown("### Feather")
-                feather = gr.Slider(
-                    minimum=0, maximum=20, value=DEFAULT_FEATHER,
-                    step=1, label="Edge softness (px)"
-                )
-
-                gr.Markdown("---")
-                btn_run     = gr.Button("▶ Run model (this photo)", variant="primary")
-                btn_run_all = gr.Button("▶ Run all 3 photos")
-                btn_clear   = gr.Button("Clear strokes")
-                btn_export  = gr.Button("Export PNGs", variant="secondary")
+                gr.HTML('<hr style="border-color:#444;margin:8px 0">')
+                gr.HTML('<p class="st1-label">Threshold</p>')
+                threshold = gr.Slider(0.0, 1.0, value=DEFAULT_THRESHOLD,
+                                      step=0.01, label="",
+                                      show_label=False)
+                gr.HTML('<p class="st1-label">Feather</p>')
+                feather = gr.Slider(0, 20, value=DEFAULT_FEATHER,
+                                    step=1, label="",
+                                    show_label=False)
+                gr.HTML('<hr style="border-color:#444;margin:8px 0">')
+                btn_apply   = gr.Button("✓ Apply strokes",          variant="primary")
+                btn_run     = gr.Button("▶ Run model (this photo)", variant="secondary")
+                btn_run_all = gr.Button("▶ Run all 3 photos",       variant="secondary")
+                btn_clear   = gr.Button("↺ Reset corrections",      variant="secondary")
+                btn_export  = gr.Button("Export PNGs",              variant="secondary")
                 export_files = gr.Files(label="Downloads", visible=False)
 
-        # Status bar
-        status = gr.Markdown("Upload photos and click **Run model** to begin.")
-
-        # ── Wire up events ────────────────────────────────────────────────────
-
-        # Uploads
-        for slot_idx, upload_widget in enumerate(
-            [upload_front, upload_side, upload_back]
-        ):
-            upload_widget.change(
-                fn=lambda f, s, si=slot_idx: handle_upload(f, si, s),
-                inputs=[upload_widget, session_state],
-                outputs=[session_state, canvas, status],
-            )
-
-        # Photo switcher buttons
-        btn_front.click(
-            fn=lambda s, t, f: handle_switch_photo(s, 0, t, f),
-            inputs=[session_state, threshold, feather],
-            outputs=[session_state, canvas, status],
-        )
-        btn_side.click(
-            fn=lambda s, t, f: handle_switch_photo(s, 1, t, f),
-            inputs=[session_state, threshold, feather],
-            outputs=[session_state, canvas, status],
-        )
-        btn_back.click(
-            fn=lambda s, t, f: handle_switch_photo(s, 2, t, f),
-            inputs=[session_state, threshold, feather],
-            outputs=[session_state, canvas, status],
+        status = gr.Markdown(
+            "Upload a photo. Paint green to keep, red to remove. Click **Apply strokes**."
         )
 
-        # Model run
-        btn_run.click(
-            fn=lambda s, t, fe: handle_run_model(s, t, fe, device),
-            inputs=[session_state, threshold, feather],
-            outputs=[session_state, canvas, status],
-        )
-        btn_run_all.click(
-            fn=lambda s, t, fe: handle_run_all(s, t, fe, device),
-            inputs=[session_state, threshold, feather],
-            outputs=[session_state, canvas, status],
-        )
+        # ── Wiring ─────────────────────────────────────────────────────────
 
-        # Brush painting — fires on canvas click
-        canvas.select(
-            fn=handle_paint,
-            inputs=[session_state, brush_mode, brush_size, threshold, feather],
-            outputs=[session_state, canvas],
-        )
+        def _upload_and_run(path, session, slot):
+            session, img, st = handle_upload(path, slot, session,
+                                             DEFAULT_THRESHOLD, DEFAULT_FEATHER)
+            if path is not None:
+                session, img, st = handle_run_model(
+                    "[]", session, DEFAULT_THRESHOLD, DEFAULT_FEATHER, device)
+            return session, img, st
 
-        # Slider live update
-        threshold.change(
-            fn=handle_threshold_change,
-            inputs=[session_state, threshold, feather],
-            outputs=[canvas],
-        )
-        feather.change(
-            fn=handle_threshold_change,
-            inputs=[session_state, threshold, feather],
-            outputs=[canvas],
-        )
+        for si, w in enumerate([upload_front, upload_side, upload_back]):
+            w.change(fn=lambda f, s, i=si: _upload_and_run(f, s, i),
+                     inputs=[w, session_state],
+                     outputs=[session_state, canvas, status])
 
-        # Clear strokes
-        btn_clear.click(
-            fn=handle_clear_strokes,
-            inputs=[session_state, threshold, feather],
-            outputs=[session_state, canvas, status],
-        )
+        btn_front.click(fn=lambda sb,s,t,f: handle_switch(sb,s,0,t,f),
+                        inputs=[strokes_box, session_state, threshold, feather],
+                        outputs=[session_state, canvas, status])
+        btn_side.click( fn=lambda sb,s,t,f: handle_switch(sb,s,1,t,f),
+                        inputs=[strokes_box, session_state, threshold, feather],
+                        outputs=[session_state, canvas, status])
+        btn_back.click( fn=lambda sb,s,t,f: handle_switch(sb,s,2,t,f),
+                        inputs=[strokes_box, session_state, threshold, feather],
+                        outputs=[session_state, canvas, status])
 
-        # Export
+        btn_apply.click(fn=handle_apply,
+                        inputs=[strokes_box, session_state, threshold, feather],
+                        outputs=[session_state, canvas, status])
+
+        btn_run.click(fn=lambda sb,s,t,fe: handle_run_model(sb,s,t,fe,device),
+                      inputs=[strokes_box, session_state, threshold, feather],
+                      outputs=[session_state, canvas, status])
+
+        btn_run_all.click(fn=lambda sb,s,t,fe: handle_run_all(sb,s,t,fe,device),
+                          inputs=[strokes_box, session_state, threshold, feather],
+                          outputs=[session_state, canvas, status])
+
+        btn_clear.click(fn=handle_clear,
+                        inputs=[session_state, threshold, feather],
+                        outputs=[session_state, canvas, status])
+
+        threshold.change(fn=handle_threshold,
+                         inputs=[session_state, threshold, feather],
+                         outputs=[canvas])
+        feather.change(fn=handle_threshold,
+                       inputs=[session_state, threshold, feather],
+                       outputs=[canvas])
+
         btn_export.click(
-            fn=lambda s, t, f: (handle_export(s, t, f), gr.update(visible=True)),
+            fn=lambda s,t,f: (handle_export(s,t,f), gr.update(visible=True)),
             inputs=[session_state, threshold, feather],
-            outputs=[export_files, export_files],
-        )
+            outputs=[export_files, export_files])
 
     return tab
