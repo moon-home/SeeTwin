@@ -459,31 +459,33 @@ def build_stage1_tab(device: str = "cpu") -> gr.Tab:
                      inputs=[w, session_state],
                      outputs=[session_state, canvas, status])
 
+        _clear_js = "() => { if (window.seetwin_clear) window.seetwin_clear(); }"
+
         btn_front.click(fn=lambda sb,s,t,f: handle_switch(sb,s,0,t,f),
                         inputs=[strokes_box, session_state, threshold, feather],
-                        outputs=[session_state, canvas, status])
+                        outputs=[session_state, canvas, status]).then(fn=None, js=_clear_js)
         btn_side.click( fn=lambda sb,s,t,f: handle_switch(sb,s,1,t,f),
                         inputs=[strokes_box, session_state, threshold, feather],
-                        outputs=[session_state, canvas, status])
+                        outputs=[session_state, canvas, status]).then(fn=None, js=_clear_js)
         btn_back.click( fn=lambda sb,s,t,f: handle_switch(sb,s,2,t,f),
                         inputs=[strokes_box, session_state, threshold, feather],
-                        outputs=[session_state, canvas, status])
+                        outputs=[session_state, canvas, status]).then(fn=None, js=_clear_js)
 
         btn_apply.click(fn=handle_apply,
                         inputs=[strokes_box, session_state, threshold, feather],
-                        outputs=[session_state, canvas, status])
+                        outputs=[session_state, canvas, status]).then(fn=None, js=_clear_js)
 
         btn_run.click(fn=lambda sb,s,t,fe: handle_run_model(sb,s,t,fe,device),
                       inputs=[strokes_box, session_state, threshold, feather],
-                      outputs=[session_state, canvas, status])
+                      outputs=[session_state, canvas, status]).then(fn=None, js=_clear_js)
 
         btn_run_all.click(fn=lambda sb,s,t,fe: handle_run_all(sb,s,t,fe,device),
                           inputs=[strokes_box, session_state, threshold, feather],
-                          outputs=[session_state, canvas, status])
+                          outputs=[session_state, canvas, status]).then(fn=None, js=_clear_js)
 
         btn_clear.click(fn=handle_clear,
                         inputs=[session_state, threshold, feather],
-                        outputs=[session_state, canvas, status])
+                        outputs=[session_state, canvas, status]).then(fn=None, js=_clear_js)
 
         threshold.change(fn=handle_threshold,
                          inputs=[session_state, threshold, feather],
