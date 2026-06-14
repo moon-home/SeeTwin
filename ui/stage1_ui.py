@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import zipfile
 from typing import Optional
 
 import gradio as gr
@@ -425,9 +426,11 @@ def handle_run_model(strokes_json, session, threshold, feather, device):
     idx = session["active"]
     if session["images"][idx] is None:
         return session, _render_canvas(session, threshold, feather), "No photo loaded."
-    logger.info("Running model on %s…", PHOTO_LABELS[idx])
+    logger.info("Running model on slot %d (%s)…", idx, PHOTO_LABELS[idx])
     session["alpha_masks"][idx] = run_model(session["images"][idx], device=device)
     _ensure_strokes(session, idx)
+    logger.info("Model done. Alpha masks set for slots: %s",
+                [i for i, m in enumerate(session["alpha_masks"]) if m is not None])
     return session, _render_canvas(session, threshold, feather), _status(session)
 
 def handle_run_all(strokes_json, session, threshold, feather, device):
@@ -457,22 +460,38 @@ def handle_switch(strokes_json, session, slot, threshold, feather):
 def handle_threshold(session, threshold, feather):
     return _render_canvas(session, threshold, feather)
 
-def handle_export(session, threshold, feather):
+def handle_export(strokes_json, session, threshold, feather):
+    logger.info("=== handle_export CALLED ===")
+    _apply_json_strokes(strokes_json, session)
     import tempfile
-    paths = []
+    png_items = []
     for idx in range(3):
         img   = session["images"][idx]
         alpha = session["alpha_masks"][idx]
+        sl    = session["strokes"][idx]
+        logger.info("Export slot %d: img=%s  alpha=%s  strokes=%s",
+                    idx, img is not None, alpha is not None,
+                    sl.stroke_count() if sl else None)
         if img is None or alpha is None:
             continue
-        sl   = session["strokes"][idx] or StrokeLayer(img.height, img.width)
+        sl   = sl or StrokeLayer(img.height, img.width)
         mask = merge(alpha, sl, threshold=threshold, feather_px=feather)
         rgba = apply_alpha_to_image(img, mask)
-        with tempfile.NamedTemporaryFile(
-                suffix=f"_seetwin_{PHOTO_LABELS[idx].lower()}.png", delete=False) as f:
-            rgba.save(f.name, "PNG")
-            paths.append(f.name)
-    return paths
+        png_items.append((f"seetwin_{PHOTO_LABELS[idx].lower()}.png", rgba))
+
+    if not png_items:
+        logger.info("Export: nothing ready to export")
+        return gr.update(visible=False)
+
+    with tempfile.NamedTemporaryFile(suffix="_seetwin_export.zip", delete=False) as f:
+        zip_path = f.name
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname, rgba in png_items:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as pf:
+                rgba.save(pf.name, "PNG")
+                zf.write(pf.name, arcname=fname)
+    logger.info("Export ZIP ready: %s  (%d photo(s))", zip_path, len(png_items))
+    return gr.update(value=zip_path, visible=True)
 
 
 # ---------------------------------------------------------------------------
@@ -495,14 +514,15 @@ def build_stage1_tab(device: str = "cpu") -> gr.Tab:
                 upload_back  = gr.File(label="Back (T-pose)",  file_types=["image"], type="filepath")
                 gr.HTML('<p class="st1-label">Active photo</p>')
                 with gr.Row():
-                    btn_front = gr.Button("Front", size="sm")
-                    btn_side  = gr.Button("Side",  size="sm")
-                    btn_back  = gr.Button("Back",  size="sm")
+                    btn_front = gr.Button("Front", variant="secondary")
+                    btn_side  = gr.Button("Side",  variant="secondary")
+                    btn_back  = gr.Button("Back",  variant="secondary")
 
             # ── Centre: canvas only ──────────────────────────────────────────
             with gr.Column(scale=5):
                 canvas = gr.Image(
                     label="Canvas",
+                    show_label=False,
                     interactive=False,
                     type="pil",
                     height=520,
@@ -521,6 +541,7 @@ def build_stage1_tab(device: str = "cpu") -> gr.Tab:
                     choices=["🟢 Keep", "🔴 Remove"],
                     value="🔴 Remove",
                     label="",
+                    show_label=False,
                     elem_id="seetwin-mode",
                     interactive=True,
                 )
@@ -528,6 +549,7 @@ def build_stage1_tab(device: str = "cpu") -> gr.Tab:
                 brush_slider = gr.Slider(
                     0, 80, value=20, step=1,
                     label="",
+                    show_label=False,
                     elem_id="seetwin-radius",
                     interactive=True,
                 )
@@ -545,8 +567,8 @@ def build_stage1_tab(device: str = "cpu") -> gr.Tab:
                 btn_run     = gr.Button("▶ Run model (this photo)", variant="secondary")
                 btn_run_all = gr.Button("▶ Run all 3 photos",       variant="secondary")
                 btn_clear   = gr.Button("↺ Reset corrections",      variant="secondary")
-                btn_export  = gr.Button("Export PNGs",              variant="secondary")
-                export_files = gr.Files(label="Downloads", visible=False)
+                btn_export  = gr.Button("Export ZIP",               variant="secondary")
+                export_file  = gr.File(label="Download", visible=False)
 
         status = gr.Markdown(
             "Upload a photo. Paint green to keep, red to remove. Click **Apply strokes**."
@@ -603,8 +625,8 @@ def build_stage1_tab(device: str = "cpu") -> gr.Tab:
                        outputs=[canvas])
 
         btn_export.click(
-            fn=lambda s,t,f: (handle_export(s,t,f), gr.update(visible=True)),
-            inputs=[session_state, threshold, feather],
-            outputs=[export_files, export_files])
+            fn=handle_export,
+            inputs=[strokes_box, session_state, threshold, feather],
+            outputs=[export_file])
 
     return tab
