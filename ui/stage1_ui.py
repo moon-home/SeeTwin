@@ -34,63 +34,65 @@ DEFAULT_FEATHER = 2
 # src changes (i.e. after any Python handler updates the canvas).
 # ---------------------------------------------------------------------------
 STAGE1_JS = """() => {
-  var overlay = null, painting = false;
+  var overlay = null, cursorEl = null, cachedImg = null;
+  var painting = false;
+  var zoom = 1, panX = 0, panY = 0;
   window.seetwin_strokes = [];
 
-  function getContainer() {
-    return document.querySelector('#seetwin-canvas');
-  }
+  // ── DOM helpers ─────────────────────────────────────────────────────────
 
-  /* Find natural image dimensions — only used for coordinate scaling.
-     We walk up from the container to find the first img with real pixels. */
-  function getNatDims() {
+  function getContainer() { return document.querySelector('#seetwin-canvas'); }
+
+  function getNatImg() {
     var c = getContainer();
     if (!c) return null;
-    var el = c;
-    for (var depth = 0; depth < 6; depth++) {
-      var imgs = el.querySelectorAll('img');
-      for (var i = 0; i < imgs.length; i++) {
-        if (imgs[i].naturalWidth > 10) {
-          return { w: imgs[i].naturalWidth, h: imgs[i].naturalHeight,
-                   img: imgs[i] };
-        }
-      }
-      if (!el.parentElement || el.tagName === 'BODY') break;
-      el = el.parentElement;
+    var imgs = c.querySelectorAll('img');
+    for (var i = 0; i < imgs.length; i++) {
+      if (imgs[i].naturalWidth > 10) return imgs[i];
     }
     return null;
   }
 
-  /* Visual rect of the photo within the container, using the container's
-     own bounding rect (always reliable) plus the natural image aspect ratio
-     to compute letterbox offsets. */
-  function getVisualRect() {
+  // Letterbox bounds at zoom=1 / pan=0
+  function getBaseRect() {
     var c = getContainer();
     if (!c) return null;
-    var cRect = c.getBoundingClientRect();
-    if (!cRect.width || !cRect.height) return null;
-    var nd = getNatDims();
-    if (!nd) return null;
-    var natR = nd.w / nd.h, cR = cRect.width / cRect.height;
-    var dispW, dispH, offX, offY;
-    if (natR > cR) {
-      dispW = cRect.width;  dispH = cRect.width  / natR;
-      offX  = 0;            offY  = (cRect.height - dispH) / 2;
-    } else {
-      dispH = cRect.height; dispW = cRect.height * natR;
-      offY  = 0;            offX  = (cRect.width  - dispW) / 2;
-    }
-    var top  = cRect.top  + offY;
-    var left = cRect.left + offX;
-    return { top: top, left: left, right: left + dispW, bottom: top + dispH,
-             width: dispW, height: dispH, natW: nd.w, natH: nd.h,
-             img: nd.img };
+    var cr = c.getBoundingClientRect();
+    if (!cr.width || !cr.height) return null;
+    var img = getNatImg();
+    if (!img) return null;
+    var nw = img.naturalWidth, nh = img.naturalHeight;
+    var natR = nw / nh, cR = cr.width / cr.height;
+    var bw, bh;
+    if (natR > cR) { bw = cr.width;  bh = cr.width  / natR; }
+    else           { bh = cr.height; bw = cr.height * natR; }
+    return {
+      cr: cr,
+      cx: cr.left + cr.width  / 2,
+      cy: cr.top  + cr.height / 2,
+      bw: bw, bh: bh, nw: nw, nh: nh, img: img
+    };
   }
+
+  // Actual image rect in screen coords, with zoom/pan applied
+  function getVisualRect() {
+    var b = getBaseRect();
+    if (!b) return null;
+    var w = b.bw * zoom, h = b.bh * zoom;
+    var cx = b.cx + panX, cy = b.cy + panY;
+    return {
+      left: cx - w/2, top: cy - h/2, right: cx + w/2, bottom: cy + h/2,
+      width: w, height: h, nw: b.nw, nh: b.nh, cr: b.cr
+    };
+  }
+
+  // ── Brush helpers ────────────────────────────────────────────────────────
 
   function getBrushRadius() {
     var el = document.querySelector('#seetwin-radius input[type=range]');
-    return el ? parseFloat(el.value) : 24;
+    return el ? parseFloat(el.value) : 10;
   }
+
   function getBrushMode() {
     var rs = document.querySelectorAll('#seetwin-mode input[type=radio]');
     for (var i = 0; i < rs.length; i++) {
@@ -103,50 +105,149 @@ STAGE1_JS = """() => {
     return 'bg';
   }
 
-  function setupOverlay() {
-    var c = getContainer();
-    if (!c) { setTimeout(setupOverlay, 600); return; }
-    var cRect = c.getBoundingClientRect();
-    if (!cRect.width) { setTimeout(setupOverlay, 600); return; }
-    var nd = getNatDims();
-    if (!nd) { setTimeout(setupOverlay, 600); return; }
+  // Brush radius in screen pixels at current zoom
+  function getScreenRadius() {
+    var b = getBaseRect();
+    return b ? getBrushRadius() * (b.bw * zoom) / b.nw : 0;
+  }
 
-    if (overlay) { overlay.remove(); overlay = null; }
+  // ── Cursor circle ────────────────────────────────────────────────────────
 
-    overlay = document.createElement('canvas');
-    overlay.id = 'seetwin-overlay';
-    overlay.style.cssText = (
-      'position:fixed;z-index:9999;pointer-events:none;' +
-      'top:'    + cRect.top    + 'px;' +
-      'left:'   + cRect.left   + 'px;' +
-      'width:'  + cRect.width  + 'px;' +
-      'height:' + cRect.height + 'px;'
+  function ensureCursor() {
+    cursorEl = document.getElementById('seetwin-cursor');
+    if (cursorEl) return;
+    cursorEl = document.createElement('div');
+    cursorEl.id = 'seetwin-cursor';
+    cursorEl.style.cssText = (
+      'position:fixed;z-index:10000;pointer-events:none;border-radius:50%;' +
+      'border:2px solid #DC3C3C;display:none;' +
+      'transform:translate(-50%,-50%);box-sizing:border-box;'
     );
-    overlay.width  = nd.w;
-    overlay.height = nd.h;
-    document.body.appendChild(overlay);
+    document.body.appendChild(cursorEl);
+  }
 
-    nd.img.draggable = false;
+  function updateCursor(e) {
+    if (!cursorEl) return;
+    var vr = getVisualRect();
+    var b  = getBaseRect();
+    if (!vr || !b) { cursorEl.style.display = 'none'; return; }
+    var cr = b.cr;
+    var inView = (e.clientX >= Math.max(vr.left,  cr.left)  &&
+                  e.clientX <= Math.min(vr.right,  cr.right) &&
+                  e.clientY >= Math.max(vr.top,    cr.top)   &&
+                  e.clientY <= Math.min(vr.bottom, cr.bottom));
+    if (!inView) { cursorEl.style.display = 'none'; return; }
+    var sr    = getScreenRadius();
+    var mode  = getBrushMode();
+    var color = mode === 'fg' ? '#1EC878' : '#DC3C3C';
+    var diam  = Math.max(4, sr * 2);
+    cursorEl.style.display     = 'block';
+    cursorEl.style.left        = e.clientX + 'px';
+    cursorEl.style.top         = e.clientY + 'px';
+    cursorEl.style.width       = diam + 'px';
+    cursorEl.style.height      = diam + 'px';
+    cursorEl.style.borderColor = color;
+  }
+
+  // ── Overlay canvas ───────────────────────────────────────────────────────
+
+  function setupOverlay() {
+    var b = getBaseRect();
+    if (!b) { setTimeout(setupOverlay, 600); return; }
+    if (overlay) { overlay.remove(); overlay = null; }
+    overlay = document.createElement('canvas');
+    overlay.id     = 'seetwin-overlay';
+    overlay.width  = b.nw;
+    overlay.height = b.nh;
+    overlay.style.cssText = 'position:fixed;z-index:9998;pointer-events:none;';
+    document.body.appendChild(overlay);
+    cachedImg = b.img;
+    b.img.draggable = false;
+    repositionOverlay();
+    hideFullscreenButton();
   }
 
   function repositionOverlay() {
     if (!overlay) return;
-    var c = getContainer();
-    if (!c) return;
-    var cRect = c.getBoundingClientRect();
-    overlay.style.top    = cRect.top    + 'px';
-    overlay.style.left   = cRect.left   + 'px';
-    overlay.style.width  = cRect.width  + 'px';
-    overlay.style.height = cRect.height + 'px';
+    var vr = getVisualRect();
+    var b  = getBaseRect();
+    if (!vr || !b) return;
+    var cr = b.cr;
+    overlay.style.top    = vr.top    + 'px';
+    overlay.style.left   = vr.left   + 'px';
+    overlay.style.width  = vr.width  + 'px';
+    overlay.style.height = vr.height + 'px';
+    // Clip brush marks to the container's visible area
+    var ct = Math.max(0, cr.top    - vr.top);
+    var cl = Math.max(0, cr.left   - vr.left);
+    var cb = Math.max(0, vr.top    + vr.height - cr.bottom);
+    var crt = Math.max(0, vr.left  + vr.width  - cr.right);
+    overlay.style.clipPath = (
+      'inset(' + ct + 'px ' + crt + 'px ' + cb + 'px ' + cl + 'px)'
+    );
   }
-  window.addEventListener('scroll', repositionOverlay, true);
-  window.addEventListener('resize', repositionOverlay);
 
-  /* Capture-phase listeners — fire before any Gradio handler. */
+  // ── Zoom / pan ───────────────────────────────────────────────────────────
+
+  function applyTransform() {
+    var b = getBaseRect();
+    if (!b || !b.img) return;
+    cachedImg = b.img;
+    b.img.style.transformOrigin = 'center center';
+    b.img.style.transform = (
+      'translate(' + panX + 'px,' + panY + 'px) scale(' + zoom + ')'
+    );
+    repositionOverlay();
+  }
+
+  function resetZoom() {
+    zoom = 1; panX = 0; panY = 0;
+    if (cachedImg) cachedImg.style.transform = '';
+    repositionOverlay();
+  }
+
+  window.addEventListener('wheel', function (e) {
+    var b = getBaseRect();
+    if (!b) return;
+    var cr = b.cr;
+    if (e.clientX < cr.left || e.clientX > cr.right ||
+        e.clientY < cr.top  || e.clientY > cr.bottom) return;
+    e.preventDefault();
+
+    if (e.ctrlKey) {
+      // Pinch-to-zoom: hold cursor point fixed
+      var factor  = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      var newZoom = Math.max(1, Math.min(20, zoom * factor));
+      var oldCX   = b.cx + panX, oldCY = b.cy + panY;
+      panX += (e.clientX - oldCX) * (1 - newZoom / zoom);
+      panY += (e.clientY - oldCY) * (1 - newZoom / zoom);
+      zoom = newZoom;
+    } else {
+      panX -= e.deltaX;
+      panY -= e.deltaY;
+    }
+    // Clamp: image content always fills the container (no gray bars)
+    var maxX = Math.max(0, (zoom * b.bw - cr.width)  / 2);
+    var maxY = Math.max(0, (zoom * b.bh - cr.height) / 2);
+    panX = Math.max(-maxX, Math.min(maxX, panX));
+    panY = Math.max(-maxY, Math.min(maxY, panY));
+    applyTransform();
+  }, { passive: false });
+
+  window.addEventListener('scroll', repositionOverlay, true);
+  window.addEventListener('resize', function () { resetZoom(); setupOverlay(); });
+
+  // ── Brush painting ───────────────────────────────────────────────────────
+
   document.addEventListener('mousedown', function (e) {
-    var r = getVisualRect();
-    if (!r || e.clientX < r.left || e.clientX > r.right ||
-               e.clientY < r.top  || e.clientY > r.bottom) return;
+    var vr = getVisualRect();
+    var b  = getBaseRect();
+    if (!vr || !b) return;
+    var cr = b.cr;
+    if (e.clientX < Math.max(vr.left,  cr.left)  ||
+        e.clientX > Math.min(vr.right,  cr.right) ||
+        e.clientY < Math.max(vr.top,    cr.top)   ||
+        e.clientY > Math.min(vr.bottom, cr.bottom)) return;
     e.preventDefault();
     e.stopPropagation();
     painting = true;
@@ -154,6 +255,7 @@ STAGE1_JS = """() => {
   }, true);
 
   document.addEventListener('mousemove', function (e) {
+    updateCursor(e);
     if (painting) paint(e);
   });
 
@@ -162,28 +264,25 @@ STAGE1_JS = """() => {
   });
 
   function paint(e) {
-    var r = getVisualRect();
-    if (!r) return;
-    var sx = r.natW / r.width;
-    var sy = r.natH / r.height;
-    var x  = Math.round((e.clientX - r.left) * sx);
-    var y  = Math.round((e.clientY - r.top)  * sy);
-    if (x < 0 || y < 0 || x >= r.natW || y >= r.natH) return;
+    var vr = getVisualRect();
+    var b  = getBaseRect();
+    if (!vr || !b) return;
+    var x = Math.round((e.clientX - vr.left) * b.nw / vr.width);
+    var y = Math.round((e.clientY - vr.top)  * b.nh / vr.height);
+    if (x < 0 || y < 0 || x >= b.nw || y >= b.nh) return;
     var br   = Math.round(getBrushRadius());
     var mode = getBrushMode();
-
-    /* Always record — strokes reach Python even if overlay is missing */
     window.seetwin_strokes.push({ x: x, y: y, r: br, mode: mode });
-
-    /* Draw visually only if overlay canvas exists */
     if (overlay) {
-      var color = (mode === 'fg') ? '#1EC878' : '#DC3C3C';
+      var color = mode === 'fg' ? '#1EC878' : '#DC3C3C';
       var ctx = overlay.getContext('2d');
       ctx.globalAlpha = 0.65;
       ctx.fillStyle = color;
       ctx.beginPath(); ctx.arc(x, y, br, 0, 2 * Math.PI); ctx.fill();
     }
   }
+
+  // ── Sync / clear ─────────────────────────────────────────────────────────
 
   function syncBox() {
     var tb = document.querySelector('#seetwin-strokes-box textarea');
@@ -196,25 +295,33 @@ STAGE1_JS = """() => {
 
   window.seetwin_clear = function () {
     window.seetwin_strokes = [];
-    if (overlay) {
-      overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
-    }
+    if (overlay) overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
     syncBox();
   };
 
-  /* Watch only the img's src attribute — avoids firing on every Gradio
-     internal DOM update that would destroy/recreate the overlay in a loop. */
-  function startWatcher() {
-    var imgs = document.querySelectorAll('#seetwin-canvas img');
-    if (!imgs.length) { setTimeout(startWatcher, 500); return; }
-    new MutationObserver(function () {
-      if (overlay) { overlay.remove(); overlay = null; }
-      setTimeout(setupOverlay, 400);
-    }).observe(imgs[0], { attributes: true, attributeFilter: ['src'] });
+  // ── Setup ────────────────────────────────────────────────────────────────
+
+  function hideFullscreenButton() {
+    var c = getContainer();
+    if (!c) return;
+    c.querySelectorAll('button').forEach(function (btn) {
+      var t = (btn.getAttribute('title') || btn.getAttribute('aria-label') || '').toLowerCase();
+      if (t.indexOf('full') >= 0 || t.indexOf('screen') >= 0) btn.style.display = 'none';
+    });
   }
 
-  setTimeout(setupOverlay, 1500);
-  setTimeout(startWatcher,  1500);
+  function startWatcher() {
+    var img = getNatImg();
+    if (!img) { setTimeout(startWatcher, 500); return; }
+    new MutationObserver(function () {
+      resetZoom();
+      if (overlay) { overlay.remove(); overlay = null; }
+      setTimeout(setupOverlay, 400);
+    }).observe(img, { attributes: true, attributeFilter: ['src'] });
+  }
+
+  setTimeout(function () { setupOverlay(); ensureCursor(); }, 1500);
+  setTimeout(startWatcher, 1500);
 }
 """
 
@@ -223,9 +330,10 @@ _STYLE = """<style>
              letter-spacing: .05em; margin: 8px 0 2px; }
 #seetwin-mode label:first-of-type span { color: #1EC878 !important; font-weight: 600; }
 #seetwin-mode label:last-of-type  span { color: #DC3C3C !important; font-weight: 600; }
-/* Crosshair cursor + no native drag on the canvas image */
-#seetwin-canvas img, #seetwin-canvas ~ * img { cursor: crosshair !important; }
-#seetwin-canvas img { -webkit-user-drag: none; user-drag: none; }
+/* Hide native cursor on canvas — JS circle cursor takes over */
+#seetwin-canvas img { cursor: none !important; -webkit-user-drag: none; user-drag: none; }
+/* Ensure zoomed image clips to the container */
+#seetwin-canvas { overflow: hidden !important; }
 </style>"""
 
 
@@ -418,7 +526,7 @@ def build_stage1_tab(device: str = "cpu") -> gr.Tab:
                 )
                 gr.HTML('<p class="st1-label">Brush radius (px)</p>')
                 brush_slider = gr.Slider(
-                    8, 80, value=24, step=4,
+                    0, 80, value=20, step=1,
                     label="",
                     elem_id="seetwin-radius",
                     interactive=True,
