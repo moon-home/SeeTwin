@@ -29,8 +29,12 @@ def parse_args():
 
 def build_app(device: str = "cpu") -> gr.Blocks:
     from ui.stage1_ui import build_stage1_tab, STAGE1_JS
+    from ui.stage2_ui import build_stage2_tab, STAGE2_JS
 
-    with gr.Blocks(title="SeeTwin", theme=gr.themes.Soft(), js=STAGE1_JS) as app:
+    # Both JS modules are arrow-function strings; wrap in one combined call
+    COMBINED_JS = f"() => {{ ({STAGE1_JS})(); ({STAGE2_JS})(); }}"
+
+    with gr.Blocks(title="SeeTwin", theme=gr.themes.Soft(), js=COMBINED_JS) as app:
         gr.Markdown(
             "# SeeTwin\n"
             "Photo-to-rigged 3D avatar pipeline · "
@@ -39,7 +43,6 @@ def build_app(device: str = "cpu") -> gr.Blocks:
 
         with gr.Tabs():
             build_stage1_tab(device=device)
-            from ui.stage2_ui import build_stage2_tab
             build_stage2_tab()
             with gr.Tab("3 — Classification", interactive=False):
                 gr.Markdown("_Coming soon_")

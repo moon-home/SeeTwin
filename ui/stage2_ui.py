@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import numpy as np
 import gradio as gr
@@ -11,7 +13,9 @@ from pipeline.stage2_body_shape import (
     extract_keypoints, draw_landmarks,
     fit_body_shape, beta_to_measurements,
 )
-from pipeline.stage2_body_shape.keypoint_extractor import LANDMARK_NAMES
+from pipeline.stage2_body_shape.keypoint_extractor import (
+    LANDMARK_NAMES, _checker_background,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +34,6 @@ BETA_LABELS = [
     "β9 — upper/lower ratio",
 ]
 
-# Dropdown choices: (display label, integer value)
-_LM_CHOICES = [("(select landmark to correct)", -1)] + [
-    (f"[{idx:02d}] {name}", idx) for idx, name in LANDMARK_NAMES.items()
-]
-
 _STYLE = """<style>
 .st2-label { font-size: 0.78rem; color: #aaa; text-transform: uppercase;
              letter-spacing: .05em; margin: 8px 0 2px; }
@@ -47,6 +46,366 @@ _STYLE = """<style>
 .st2-beta-note { font-size: 0.78rem; color: #888; margin: 4px 0 10px;
     border-left: 3px solid #444; padding-left: 8px; line-height: 1.5; }
 </style>"""
+
+# ---------------------------------------------------------------------------
+# Stage 2 JS — interactive landmark canvas overlay.
+#
+# For each of the three annotated views (front/side/back):
+#   · A <canvas> is injected over the gr.Image display.
+#   · The canvas draws: base photo | skeleton edges | landmark dots (all
+#     scaled by zoom/pan transform) | text labels (fixed 13px, NOT scaled).
+#   · Wheel to zoom (centred on cursor), drag on empty area to pan,
+#     drag a landmark dot to reposition it.
+#   · On drag-end the new position is synced to a hidden Gradio Textbox;
+#     a Python .change() handler updates the session state.
+#   · Landmark data (from Python) arrives as base64 JSON in a hidden
+#     gr.HTML element; a MutationObserver triggers re-draw on update.
+# ---------------------------------------------------------------------------
+STAGE2_JS = r"""() => {
+  var VIEWS = ['front','side','back'];
+
+  var EDGES = [
+    [11,12],[11,13],[13,15],[12,14],[14,16],
+    [11,23],[12,24],[23,24],
+    [23,25],[25,27],[27,29],[27,31],
+    [24,26],[26,28],[28,30],[28,32]
+  ];
+
+  // L=left-side(green), R=right-side(red), C=center(gray)
+  var EDGE_SIDE = {
+    '11,12':'C','23,24':'C',
+    '11,13':'L','13,15':'L','11,23':'L','23,25':'L','25,27':'L','27,29':'L','27,31':'L',
+    '12,14':'R','14,16':'R','12,24':'R','24,26':'R','26,28':'R','28,30':'R','28,32':'R'
+  };
+  var ECOL = {L:'#00C878', R:'#DC5050', C:'#A0A0A0'};
+
+  var NAMES = {
+    0:'nose',1:'L-eye-in',2:'L-eye',3:'L-eye-out',
+    4:'R-eye-in',5:'R-eye',6:'R-eye-out',
+    7:'L-ear',8:'R-ear',9:'mouth-L',10:'mouth-R',
+    11:'L-shldr',12:'R-shldr',13:'L-elbow',14:'R-elbow',
+    15:'L-wrist',16:'R-wrist',17:'L-pinky',18:'R-pinky',
+    19:'L-index',20:'R-index',21:'L-thumb',22:'R-thumb',
+    23:'L-hip',24:'R-hip',25:'L-knee',26:'R-knee',
+    27:'L-ankle',28:'R-ankle',29:'L-heel',30:'R-heel',
+    31:'L-foot',32:'R-foot'
+  };
+
+  // Per-view state
+  var VS = {};
+  VIEWS.forEach(function(v) {
+    VS[v] = {
+      canvas:null, ctx:null,
+      img:null, imgW:0, imgH:0,
+      landmarks:null,
+      zoom:1, panX:0, panY:0,
+      dragging:-1,
+      panning:false, panStart:null,
+      _lastSrc:'', _lastB64:''
+    };
+  });
+
+  // ── Drawing ───────────────────────────────────────────────────────────────
+
+  function drawView(v) {
+    var s = VS[v];
+    if (!s.canvas || !s.ctx) return;
+    var ctx = s.ctx;
+    var W = s.canvas.width, H = s.canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    // --- scaled section (image + skeleton + dots) ---
+    ctx.save();
+    ctx.translate(s.panX, s.panY);
+    ctx.scale(s.zoom, s.zoom);
+
+    if (s.img && s.img.complete && s.imgW > 0) {
+      ctx.drawImage(s.img, 0, 0, s.imgW, s.imgH);
+    }
+
+    if (s.landmarks) {
+      // Skeleton edges
+      ctx.lineWidth = 3.5;
+      EDGES.forEach(function(pair) {
+        var a = pair[0], b = pair[1];
+        var la = s.landmarks[a], lb = s.landmarks[b];
+        if (!la || !lb) return;
+        var key = a + ',' + b;
+        var side = EDGE_SIDE[key] || 'C';
+        var vis = Math.min(la.visibility, lb.visibility);
+        ctx.globalAlpha = Math.max(0.35, vis);
+        ctx.strokeStyle = ECOL[side];
+        ctx.beginPath();
+        ctx.moveTo(la.x * s.imgW, la.y * s.imgH);
+        ctx.lineTo(lb.x * s.imgW, lb.y * s.imgH);
+        ctx.stroke();
+      });
+
+      // Dots
+      s.landmarks.forEach(function(lm, idx) {
+        if (!lm) return;
+        var x = lm.x * s.imgW, y = lm.y * s.imgH;
+        var isDrag = (idx === s.dragging);
+        ctx.globalAlpha = Math.max(0.4, lm.visibility);
+        ctx.fillStyle   = isDrag ? '#FFFFFF' : '#FFDC32';
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth   = 2;
+        ctx.beginPath();
+        ctx.arc(x, y, isDrag ? 10 : 7, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.stroke();
+      });
+    }
+
+    ctx.restore(); // ← restore here so text below is NOT scaled
+
+    // --- fixed-size text labels ---
+    if (s.landmarks) {
+      ctx.font = '13px "Helvetica Neue",Helvetica,Arial,sans-serif';
+      s.landmarks.forEach(function(lm, idx) {
+        if (!lm) return;
+        var name = NAMES[idx];
+        if (!name) return;
+        // Convert landmark position to canvas (screen) coords
+        var cx = lm.x * s.imgW * s.zoom + s.panX;
+        var cy = lm.y * s.imgH * s.zoom + s.panY;
+        // Skip if off-canvas
+        if (cx < -80 || cx > W + 80 || cy < -20 || cy > H + 20) return;
+        var tx = cx + 9, ty = cy - 7;
+        // Shadow
+        ctx.globalAlpha = 0.85;
+        ctx.fillStyle = '#000000';
+        ctx.fillText(name, tx+1, ty+1);
+        ctx.fillText(name, tx-1, ty-1);
+        ctx.fillText(name, tx+1, ty-1);
+        ctx.fillText(name, tx-1, ty+1);
+        // Label
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = (idx === s.dragging) ? '#FFFFFF' : '#FFDC32';
+        ctx.fillText(name, tx, ty);
+      });
+    }
+  }
+
+  // ── Canvas setup ──────────────────────────────────────────────────────────
+
+  function setupCanvas(v) {
+    var s    = VS[v];
+    var host = document.querySelector('#s2-ann-' + v);
+    if (!host) return;
+
+    // Find the actual <img> element
+    var img = host.querySelector('img');
+    if (!img || !img.src || img.naturalWidth < 4) return;
+
+    // Already set up for this image?
+    if (s.canvas && img.src === s._lastSrc) return;
+    s._lastSrc = img.src;
+
+    // Find parent container — prefer .image-frame
+    var frame = host.querySelector('.image-frame') || host;
+    if (frame.style.position !== 'relative') frame.style.position = 'relative';
+
+    // Remove old canvas
+    if (s.canvas) { s.canvas.remove(); s.canvas = null; }
+
+    // Size canvas to match the displayed image area
+    var fRect = frame.getBoundingClientRect();
+    var iRect = img.getBoundingClientRect();
+    if (!iRect.width) return;
+
+    var canvas = document.createElement('canvas');
+    canvas.className = 's2-lm-canvas';
+    canvas.width  = Math.round(iRect.width);
+    canvas.height = Math.round(iRect.height);
+    // Position over the image (offset relative to frame)
+    var top  = iRect.top  - fRect.top;
+    var left = iRect.left - fRect.left;
+    canvas.style.cssText = (
+      'position:absolute;z-index:20;cursor:crosshair;pointer-events:auto;' +
+      'top:' + top + 'px;left:' + left + 'px;' +
+      'width:'  + iRect.width  + 'px;' +
+      'height:' + iRect.height + 'px;'
+    );
+    frame.appendChild(canvas);
+
+    s.canvas = canvas;
+    s.ctx    = canvas.getContext('2d');
+    s.imgW   = img.naturalWidth;
+    s.imgH   = img.naturalHeight;
+    s.zoom   = 1; s.panX = 0; s.panY = 0;
+
+    // Load image into JS Image for ctx.drawImage
+    var ci = new Image();
+    ci.crossOrigin = 'anonymous';
+    ci.onload = function() { s.img = ci; drawView(v); };
+    ci.src = img.src;
+    if (ci.complete) { s.img = ci; drawView(v); }
+
+    // Events
+    canvas.addEventListener('mousedown',  function(e){ onDown(e,v); });
+    canvas.addEventListener('mousemove',  function(e){ onMove(e,v); });
+    canvas.addEventListener('mouseup',    function(e){ onUp(e,v); });
+    canvas.addEventListener('mouseleave', function(e){ onLeave(e,v); });
+    canvas.addEventListener('wheel',      function(e){ onWheel(e,v); },{passive:false});
+    canvas.addEventListener('contextmenu',function(e){ e.preventDefault(); });
+  }
+
+  // ── Mouse helpers ─────────────────────────────────────────────────────────
+
+  function canvasXY(e, canvas) {
+    var r = canvas.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+
+  function nearestLM(cx, cy, s) {
+    if (!s.landmarks) return -1;
+    var SNAP = 15;   // px in canvas space
+    var best = -1, bestD = Infinity;
+    s.landmarks.forEach(function(lm, idx) {
+      if (!lm) return;
+      var sx = lm.x * s.imgW * s.zoom + s.panX;
+      var sy = lm.y * s.imgH * s.zoom + s.panY;
+      var d  = Math.sqrt((cx-sx)*(cx-sx) + (cy-sy)*(cy-sy));
+      if (d < SNAP && d < bestD) { bestD = d; best = idx; }
+    });
+    return best;
+  }
+
+  function onDown(e, v) {
+    var s = VS[v];
+    var pos = canvasXY(e, s.canvas);
+    var idx = nearestLM(pos[0], pos[1], s);
+    if (idx >= 0) {
+      s.dragging = idx;
+      s.canvas.style.cursor = 'grabbing';
+      e.preventDefault();
+    } else {
+      s.panning  = true;
+      s.panStart = [e.clientX - s.panX, e.clientY - s.panY];
+      s.canvas.style.cursor = 'grab';
+    }
+  }
+
+  function onMove(e, v) {
+    var s = VS[v];
+    if (!s.canvas) return;
+
+    if (s.dragging >= 0 && s.landmarks) {
+      var pos = canvasXY(e, s.canvas);
+      var nx = (pos[0] - s.panX) / (s.imgW * s.zoom);
+      var ny = (pos[1] - s.panY) / (s.imgH * s.zoom);
+      nx = Math.max(0, Math.min(1, nx));
+      ny = Math.max(0, Math.min(1, ny));
+      s.landmarks[s.dragging].x = nx;
+      s.landmarks[s.dragging].y = ny;
+      drawView(v);
+      e.preventDefault();
+    } else if (s.panning) {
+      s.panX = e.clientX - s.panStart[0];
+      s.panY = e.clientY - s.panStart[1];
+      drawView(v);
+    } else {
+      var pos2 = canvasXY(e, s.canvas);
+      var near = nearestLM(pos2[0], pos2[1], s);
+      s.canvas.style.cursor = near >= 0 ? 'grab' : 'crosshair';
+    }
+  }
+
+  function onUp(e, v) {
+    var s = VS[v];
+    if (s.dragging >= 0) {
+      syncLandmark(v, s.dragging);
+      s.dragging = -1;
+      s.canvas.style.cursor = 'crosshair';
+    }
+    s.panning = false;
+  }
+
+  function onLeave(e, v) {
+    VS[v].panning = false;
+  }
+
+  function onWheel(e, v) {
+    e.preventDefault();
+    var s = VS[v];
+    var pos = canvasXY(e, s.canvas);
+    var cx = pos[0], cy = pos[1];
+    var f  = e.deltaY > 0 ? 0.85 : 1.18;
+    s.panX = cx - (cx - s.panX) * f;
+    s.panY = cy - (cy - s.panY) * f;
+    s.zoom = Math.max(0.4, Math.min(8, s.zoom * f));
+    drawView(v);
+  }
+
+  // ── JS → Python sync ──────────────────────────────────────────────────────
+
+  function syncLandmark(v, idx) {
+    var lm = VS[v].landmarks && VS[v].landmarks[idx];
+    if (!lm) return;
+    var tb = document.querySelector('#s2-lm-up-' + v + ' textarea');
+    if (!tb) return;
+    var val = JSON.stringify({idx:idx, x:lm.x, y:lm.y});
+    var setter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(tb, val);
+    tb.dispatchEvent(new Event('input', {bubbles:true}));
+  }
+
+  // ── Python → JS landmark data ─────────────────────────────────────────────
+
+  function loadLmData(v) {
+    var el = document.querySelector('#s2-lm-data-' + v);
+    if (!el) return;
+    var tag = el.querySelector('[data-b64]');
+    if (!tag) return;
+    var b64 = tag.getAttribute('data-b64');
+    if (!b64 || b64 === VS[v]._lastB64) return;
+    VS[v]._lastB64 = b64;
+    try { VS[v].landmarks = JSON.parse(atob(b64)); }
+    catch(err) { VS[v].landmarks = null; }
+    drawView(v);
+  }
+
+  // ── Watchers ──────────────────────────────────────────────────────────────
+
+  function watchView(v) {
+    // Re-init canvas when gr.Image changes its src
+    var annEl = document.querySelector('#s2-ann-' + v);
+    if (annEl) {
+      new MutationObserver(function() {
+        setTimeout(function() { setupCanvas(v); loadLmData(v); }, 250);
+      }).observe(annEl, {childList:true, subtree:true,
+                          attributes:true, attributeFilter:['src']});
+    }
+
+    // Reload landmarks when Python updates the hidden gr.HTML
+    var lmEl = document.querySelector('#s2-lm-data-' + v);
+    if (lmEl) {
+      new MutationObserver(function() {
+        setTimeout(function() { loadLmData(v); }, 80);
+      }).observe(lmEl, {childList:true, subtree:true});
+    }
+  }
+
+  function init() {
+    VIEWS.forEach(function(v) {
+      watchView(v);
+      setupCanvas(v);
+      loadLmData(v);
+    });
+    // Re-setup on resize (canvas position may shift)
+    window.addEventListener('resize', function() {
+      VIEWS.forEach(function(v) {
+        if (VS[v].canvas) { VS[v].canvas.remove(); VS[v].canvas = null; }
+        VS[v]._lastSrc = '';
+        setTimeout(function() { setupCanvas(v); }, 300);
+      });
+    });
+  }
+
+  setTimeout(init, 1500);
+}"""
 
 
 def _measurements_html(m: dict) -> str:
@@ -71,27 +430,42 @@ def _empty_state() -> dict:
     }
 
 
-def _render_ann(state: dict, view: str, selected_idx: int = -1) -> Image.Image | None:
-    img = state.get(f"img_{view}")
-    kp  = state.get(f"kp_{view}")
-    if img is None or kp is None:
-        return None
-    return draw_landmarks(img, kp, selected_idx=selected_idx)
+def _base_photo(img: Image.Image) -> Image.Image:
+    """Composite RGBA on checker background; return RGB for gr.Image display."""
+    if img.mode == "RGBA":
+        bg = _checker_background(img.width, img.height)
+        return Image.alpha_composite(bg, img).convert("RGB")
+    return img.convert("RGB")
+
+
+def _lm_data_html(kp: dict | None) -> str:
+    """Encode landmark list as base64 JSON inside an HTML data attribute."""
+    if not kp or not kp.get("detected"):
+        return ""
+    b64 = base64.b64encode(
+        json.dumps(kp["landmarks"]).encode()
+    ).decode()
+    return f'<span data-b64="{b64}"></span>'
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 def handle_extract(img_front, img_side, img_back, state: dict):
-    """Extract MediaPipe keypoints from uploaded photos."""
+    """Extract MediaPipe keypoints; return base photos + landmark data for JS."""
     photos = {"front": img_front, "side": img_side, "back": img_back}
+    base, lm_html = {}, {}
 
     for view, img in photos.items():
-        state[f"img_{view}"] = img  # store original (may be RGBA from Stage 1)
+        state[f"img_{view}"] = img
         if img is None:
             state[f"kp_{view}"] = None
+            base[view]    = None
+            lm_html[view] = ""
             continue
         kp = extract_keypoints(img)
         state[f"kp_{view}"] = kp
+        base[view]    = _base_photo(img)
+        lm_html[view] = _lm_data_html(kp)
         logger.info("Keypoints %s: detected=%s", view, kp.get("detected"))
 
     if img_front is not None:
@@ -101,14 +475,15 @@ def handle_extract(img_front, img_side, img_back, state: dict):
         1 for v in ["front", "side", "back"]
         if state.get(f"kp_{v}") and state[f"kp_{v}"].get("detected")
     )
-    status = (f"Keypoints extracted — {detected}/3 views detected."
+    status = (f"Keypoints extracted — {detected}/3 views detected. "
+              "Drag any landmark dot to correct its position."
               if detected > 0 else
               "No person detected in any photo. Check photo quality.")
 
-    ann_f = _render_ann(state, "front")
-    ann_s = _render_ann(state, "side")
-    ann_b = _render_ann(state, "back")
-    return state, ann_f, ann_s, ann_b, status
+    return (state,
+            base["front"], base["side"], base["back"],
+            lm_html["front"], lm_html["side"], lm_html["back"],
+            status)
 
 
 def handle_fit(state: dict):
@@ -127,65 +502,30 @@ def handle_fit(state: dict):
 
 
 def handle_beta_update(state: dict, *slider_vals):
-    """Recompute measurements when β sliders change. Landmarks are unaffected
-    because they reflect MediaPipe detections, not the 3D model pose."""
+    """Recompute measurements when β sliders change.
+    Landmark positions are MediaPipe detections and do not move with β."""
     beta = np.array(slider_vals, dtype=np.float32)
     state["beta"] = beta.tolist()
     return state, _measurements_html(beta_to_measurements(beta))
 
 
-def handle_lm_select(state: dict, lm_idx):
-    """Highlight the selected landmark (white dot) in all three views."""
-    idx = int(lm_idx) if lm_idx is not None else -1
-    ann_f = _render_ann(state, "front", selected_idx=idx)
-    ann_s = _render_ann(state, "side",  selected_idx=idx)
-    ann_b = _render_ann(state, "back",  selected_idx=idx)
-
-    if idx < 0:
-        msg = "Select a landmark from the dropdown, then click on an annotated image to reposition it."
-    else:
-        name = LANDMARK_NAMES.get(idx, str(idx))
-        msg = f"**{name}** selected (white dot). Click anywhere on an annotated image to move it there."
-
-    return (ann_f if ann_f is not None else gr.update(),
-            ann_s if ann_s is not None else gr.update(),
-            ann_b if ann_b is not None else gr.update(),
-            msg)
-
-
-def _do_landmark_click(evt: gr.SelectData, state: dict, view: str, lm_idx):
-    """Move the chosen landmark to the pixel the user clicked."""
-    idx = int(lm_idx) if lm_idx is not None else -1
-    if idx < 0:
-        return (state,
-                gr.update(), gr.update(), gr.update(),
-                "Select a landmark from the dropdown first, then click to place it.")
-
-    kp  = state.get(f"kp_{view}")
-    img = state.get(f"img_{view}")
-    if not kp or not kp.get("detected") or img is None:
-        return (state,
-                gr.update(), gr.update(), gr.update(),
-                f"No keypoints detected for the {view} view.")
-
-    # evt.index is (x, y) in original image pixel coordinates
-    x_norm = evt.index[0] / img.width
-    y_norm = evt.index[1] / img.height
-    kp["landmarks"][idx]["x"] = x_norm
-    kp["landmarks"][idx]["y"] = y_norm
-    kp["landmarks"][idx]["visibility"] = 1.0  # trust manual correction
-    state[f"kp_{view}"] = kp
-
-    ann_f = _render_ann(state, "front", selected_idx=idx)
-    ann_s = _render_ann(state, "side",  selected_idx=idx)
-    ann_b = _render_ann(state, "back",  selected_idx=idx)
-
-    name = LANDMARK_NAMES.get(idx, str(idx))
-    return (state,
-            ann_f if ann_f is not None else gr.update(),
-            ann_s if ann_s is not None else gr.update(),
-            ann_b if ann_b is not None else gr.update(),
-            f"Moved **{name}** in {view} view → ({x_norm:.3f}, {y_norm:.3f}).")
+def _make_lm_update_handler(view: str):
+    def handler(state: dict, correction_json: str):
+        if not correction_json:
+            return state
+        try:
+            data = json.loads(correction_json)
+            idx  = int(data["idx"])
+            kp   = state.get(f"kp_{view}")
+            if kp and kp.get("detected") and 0 <= idx < 33:
+                kp["landmarks"][idx]["x"] = float(data["x"])
+                kp["landmarks"][idx]["y"] = float(data["y"])
+                kp["landmarks"][idx]["visibility"] = 1.0
+                state[f"kp_{view}"] = kp
+        except Exception as exc:
+            logger.warning("Bad landmark update (%s): %s", view, exc)
+        return state
+    return handler
 
 
 def handle_confirm(state: dict):
@@ -206,7 +546,9 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
             # ── Left: photo inputs ─────────────────────────────────────────
             with gr.Column(scale=3):
                 gr.Markdown("### Input photos")
-                gr.HTML('<p class="st2-label">Transparent PNGs from Stage 1 (or upload directly)</p>')
+                gr.HTML(
+                    '<p class="st2-label">Transparent PNGs from Stage 1 (or upload directly)</p>'
+                )
                 img_front = gr.Image(label="Front", type="pil", height=260)
                 img_side  = gr.Image(label="Side",  type="pil", height=260)
                 img_back  = gr.Image(label="Back",  type="pil", height=260)
@@ -218,29 +560,36 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
                 gr.HTML(
                     '<p style="font-size:0.82rem;color:#aaa;margin:2px 0 10px">'
                     "Green = left side · Red = right side · Yellow = landmark<br>"
-                    "Select a landmark below, then click an annotated view to reposition it."
+                    "<strong>Drag</strong> any dot to correct its position · "
+                    "<strong>Scroll</strong> to zoom · <strong>Drag empty area</strong> to pan"
                     "</p>"
                 )
-                ann_front = gr.Image(label="Front", type="pil", height=300,
-                                     show_label=True, interactive=False)
-                ann_side  = gr.Image(label="Side",  type="pil", height=300,
-                                     show_label=True, interactive=False)
-                ann_back  = gr.Image(label="Back",  type="pil", height=300,
-                                     show_label=True, interactive=False)
+                ann_front = gr.Image(
+                    label="Front", type="pil", height=300,
+                    show_label=True, interactive=False,
+                    elem_id="s2-ann-front",
+                )
+                ann_side  = gr.Image(
+                    label="Side",  type="pil", height=300,
+                    show_label=True, interactive=False,
+                    elem_id="s2-ann-side",
+                )
+                ann_back  = gr.Image(
+                    label="Back",  type="pil", height=300,
+                    show_label=True, interactive=False,
+                    elem_id="s2-ann-back",
+                )
+                # Hidden: Python → JS landmark data (base64 JSON in data attribute)
+                lm_html_f = gr.HTML("", visible=False, elem_id="s2-lm-data-front")
+                lm_html_s = gr.HTML("", visible=False, elem_id="s2-lm-data-side")
+                lm_html_b = gr.HTML("", visible=False, elem_id="s2-lm-data-back")
+
+                # Hidden: JS → Python drag corrections
+                lm_up_f = gr.Textbox("", visible=False, elem_id="s2-lm-up-front")
+                lm_up_s = gr.Textbox("", visible=False, elem_id="s2-lm-up-side")
+                lm_up_b = gr.Textbox("", visible=False, elem_id="s2-lm-up-back")
 
                 gr.HTML('<hr style="border-color:#333;margin:12px 0 8px">')
-                gr.HTML('<p class="st2-label">Correct a landmark</p>')
-                selected_lm = gr.Dropdown(
-                    choices=_LM_CHOICES,
-                    value=-1,
-                    label="Landmark to reposition",
-                )
-                gr.HTML(
-                    '<p style="font-size:0.8rem;color:#888;margin:4px 0 10px">'
-                    "After selecting a landmark it will highlight in white. "
-                    "Click anywhere on the annotated image above to move it."
-                    "</p>"
-                )
                 btn_refit = gr.Button("Re-fit with corrected landmarks", variant="secondary")
 
             # ── Right: fit controls + measurements ─────────────────────────
@@ -256,12 +605,11 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
                     gr.HTML('<p class="st2-label">Manual β correction</p>')
                     gr.HTML(
                         '<p class="st2-beta-note">'
-                        "β controls the 3D SMPL-X body shape — measurements update live "
-                        "as you drag these sliders.<br><br>"
-                        "The landmark overlay positions come from MediaPipe photo detection "
-                        "and do <em>not</em> change with β. "
-                        "To correct wrong landmarks, use the <strong>Correct a landmark</strong> "
-                        "tool in the centre panel, then click "
+                        "β controls the 3D SMPL-X body shape — measurements update live.<br><br>"
+                        "Landmark dot positions come from MediaPipe detection and do "
+                        "<em>not</em> change with β. "
+                        "Drag landmark dots on the overlay (centre panel) to correct "
+                        "wrong detections, then click "
                         "<strong>Re-fit with corrected landmarks</strong>."
                         "</p>"
                     )
@@ -283,7 +631,10 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
         btn_extract.click(
             fn=handle_extract,
             inputs=[img_front, img_side, img_back, state],
-            outputs=[state, ann_front, ann_side, ann_back, status],
+            outputs=[state,
+                     ann_front, ann_side, ann_back,
+                     lm_html_f, lm_html_s, lm_html_b,
+                     status],
         )
 
         btn_fit.click(
@@ -292,44 +643,27 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
             outputs=[state, meas_html, beta_group] + beta_sliders,
         )
 
-        # Landmark dropdown → highlight in all views
-        selected_lm.change(
-            fn=handle_lm_select,
-            inputs=[state, selected_lm],
-            outputs=[ann_front, ann_side, ann_back, status],
-        )
-
-        # Click on annotated image → move selected landmark
-        def click_front(evt: gr.SelectData, s, lm):
-            return _do_landmark_click(evt, s, "front", lm)
-
-        def click_side(evt: gr.SelectData, s, lm):
-            return _do_landmark_click(evt, s, "side", lm)
-
-        def click_back(evt: gr.SelectData, s, lm):
-            return _do_landmark_click(evt, s, "back", lm)
-
-        ann_front.select(
-            fn=click_front,
-            inputs=[state, selected_lm],
-            outputs=[state, ann_front, ann_side, ann_back, status],
-        )
-        ann_side.select(
-            fn=click_side,
-            inputs=[state, selected_lm],
-            outputs=[state, ann_front, ann_side, ann_back, status],
-        )
-        ann_back.select(
-            fn=click_back,
-            inputs=[state, selected_lm],
-            outputs=[state, ann_front, ann_side, ann_back, status],
-        )
-
-        # Re-fit with (possibly corrected) keypoints
         btn_refit.click(
             fn=handle_fit,
             inputs=[state],
             outputs=[state, meas_html, beta_group] + beta_sliders,
+        )
+
+        # JS drag corrections → update Python state (silent, no re-render)
+        lm_up_f.change(
+            fn=_make_lm_update_handler("front"),
+            inputs=[state, lm_up_f],
+            outputs=[state],
+        )
+        lm_up_s.change(
+            fn=_make_lm_update_handler("side"),
+            inputs=[state, lm_up_s],
+            outputs=[state],
+        )
+        lm_up_b.change(
+            fn=_make_lm_update_handler("back"),
+            inputs=[state, lm_up_b],
+            outputs=[state],
         )
 
         # Live β adjustment → measurements only
