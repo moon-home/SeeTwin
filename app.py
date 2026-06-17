@@ -39,9 +39,8 @@ def build_app(device: str = "cpu") -> gr.Blocks:
 
         with gr.Tabs():
             build_stage1_tab(device=device)
-            # Stages 2–9 will be added here as they are built
-            with gr.Tab("2 — Body shape", interactive=False):
-                gr.Markdown("_Coming soon_")
+            from ui.stage2_ui import build_stage2_tab
+            build_stage2_tab()
             with gr.Tab("3 — Classification", interactive=False):
                 gr.Markdown("_Coming soon_")
             with gr.Tab("4 — Texture extraction", interactive=False):

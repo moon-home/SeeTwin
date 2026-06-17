@@ -84,7 +84,7 @@ Stage 9 — Pose Analysis (Kimodo)
 ---
 
 ### Stage 2 — Body Shape Estimation
-**Input:** Front + side transparent PNGs
+**Input:** Front + side + back transparent PNGs
 
 **Output:** SMPL-X shape parameter vector β (10 values: height, weight, torso width, limb lengths, etc.)
 
