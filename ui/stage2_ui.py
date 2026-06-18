@@ -71,7 +71,6 @@ STAGE2_JS = r"""() => {
     [24,26],[26,28],[28,30],[28,32]
   ];
 
-  // L=left-side(green), R=right-side(red), C=center(gray)
   var EDGE_SIDE = {
     '11,12':'C','23,24':'C',
     '11,13':'L','13,15':'L','11,23':'L','23,25':'L','25,27':'L','27,29':'L','27,31':'L',
@@ -91,17 +90,17 @@ STAGE2_JS = r"""() => {
     31:'L-foot',32:'R-foot'
   };
 
-  // Per-view state
   var VS = {};
   VIEWS.forEach(function(v) {
     VS[v] = {
       canvas:null, ctx:null,
       img:null, imgW:0, imgH:0,
       landmarks:null,
-      zoom:1, panX:0, panY:0,
+      fitZoom:1, zoom:1, panX:0, panY:0,
       dragging:-1,
       panning:false, panStart:null,
-      _lastSrc:'', _lastB64:''
+      _lastSrc:'', _lastB64:'',
+      _toast:null, _toastTimer:null
     };
   });
 
@@ -114,7 +113,6 @@ STAGE2_JS = r"""() => {
     var W = s.canvas.width, H = s.canvas.height;
     ctx.clearRect(0, 0, W, H);
 
-    // --- scaled section (image + skeleton + dots) ---
     ctx.save();
     ctx.translate(s.panX, s.panY);
     ctx.scale(s.zoom, s.zoom);
@@ -124,8 +122,8 @@ STAGE2_JS = r"""() => {
     }
 
     if (s.landmarks) {
-      // Skeleton edges
-      ctx.lineWidth = 3.5;
+      // Lines and dots are drawn in image-space but sized to be constant screen pixels
+      ctx.lineWidth = 3.5 / s.zoom;
       EDGES.forEach(function(pair) {
         var a = pair[0], b = pair[1];
         var la = s.landmarks[a], lb = s.landmarks[b];
@@ -141,7 +139,8 @@ STAGE2_JS = r"""() => {
         ctx.stroke();
       });
 
-      // Dots
+      var dotR = 7 / s.zoom;
+      ctx.lineWidth = 2 / s.zoom;
       s.landmarks.forEach(function(lm, idx) {
         if (!lm) return;
         var x = lm.x * s.imgW, y = lm.y * s.imgH;
@@ -149,41 +148,51 @@ STAGE2_JS = r"""() => {
         ctx.globalAlpha = Math.max(0.4, lm.visibility);
         ctx.fillStyle   = isDrag ? '#FFFFFF' : '#FFDC32';
         ctx.strokeStyle = '#000000';
-        ctx.lineWidth   = 2;
         ctx.beginPath();
-        ctx.arc(x, y, isDrag ? 10 : 7, 0, 2 * Math.PI);
+        ctx.arc(x, y, isDrag ? dotR * 1.4 : dotR, 0, 2 * Math.PI);
         ctx.fill();
         ctx.stroke();
       });
     }
 
-    ctx.restore(); // ← restore here so text below is NOT scaled
+    ctx.restore(); // text is drawn below in canvas-pixel space (not scaled)
 
-    // --- fixed-size text labels ---
     if (s.landmarks) {
       ctx.font = '13px "Helvetica Neue",Helvetica,Arial,sans-serif';
       s.landmarks.forEach(function(lm, idx) {
         if (!lm) return;
         var name = NAMES[idx];
         if (!name) return;
-        // Convert landmark position to canvas (screen) coords
         var cx = lm.x * s.imgW * s.zoom + s.panX;
         var cy = lm.y * s.imgH * s.zoom + s.panY;
-        // Skip if off-canvas
         if (cx < -80 || cx > W + 80 || cy < -20 || cy > H + 20) return;
         var tx = cx + 9, ty = cy - 7;
-        // Shadow
         ctx.globalAlpha = 0.85;
         ctx.fillStyle = '#000000';
         ctx.fillText(name, tx+1, ty+1);
         ctx.fillText(name, tx-1, ty-1);
         ctx.fillText(name, tx+1, ty-1);
         ctx.fillText(name, tx-1, ty+1);
-        // Label
         ctx.globalAlpha = 1;
         ctx.fillStyle = (idx === s.dragging) ? '#FFFFFF' : '#FFDC32';
         ctx.fillText(name, tx, ty);
       });
+    }
+
+    // Toast notification (zoom limit alert)
+    if (s._toast) {
+      var midX = W / 2;
+      ctx.save();
+      ctx.font = 'bold 12px "Helvetica Neue",Helvetica,Arial,sans-serif';
+      ctx.textAlign = 'center';
+      var tw = ctx.measureText(s._toast).width;
+      ctx.globalAlpha = 0.82;
+      ctx.fillStyle = '#1a1a1a';
+      ctx.fillRect(midX - tw/2 - 12, 10, tw + 24, 28);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#FFDC32';
+      ctx.fillText(s._toast, midX, 29);
+      ctx.restore();
     }
   }
 
@@ -194,31 +203,25 @@ STAGE2_JS = r"""() => {
     var host = document.querySelector('#s2-ann-' + v);
     if (!host) return;
 
-    // Find the actual <img> element
     var img = host.querySelector('img');
     if (!img || !img.src || img.naturalWidth < 4) return;
 
-    // Already set up for this image?
-    if (s.canvas && img.src === s._lastSrc) return;
+    if (s.canvas && img.src === s._lastSrc && s.canvas.width > 0) return;
     s._lastSrc = img.src;
 
-    // Find parent container — prefer .image-frame
     var frame = host.querySelector('.image-frame') || host;
     if (frame.style.position !== 'relative') frame.style.position = 'relative';
 
-    // Remove old canvas
     if (s.canvas) { s.canvas.remove(); s.canvas = null; }
 
-    // Size canvas to match the displayed image area
     var fRect = frame.getBoundingClientRect();
     var iRect = img.getBoundingClientRect();
-    if (!iRect.width) return;
+    if (!iRect.width || !iRect.height) return;
 
     var canvas = document.createElement('canvas');
     canvas.className = 's2-lm-canvas';
     canvas.width  = Math.round(iRect.width);
     canvas.height = Math.round(iRect.height);
-    // Position over the image (offset relative to frame)
     var top  = iRect.top  - fRect.top;
     var left = iRect.left - fRect.left;
     canvas.style.cssText = (
@@ -233,16 +236,34 @@ STAGE2_JS = r"""() => {
     s.ctx    = canvas.getContext('2d');
     s.imgW   = img.naturalWidth;
     s.imgH   = img.naturalHeight;
-    s.zoom   = 1; s.panX = 0; s.panY = 0;
 
-    // Load image into JS Image for ctx.drawImage
+    // Fit zoom: scale so the full image fills the canvas at zoom=1
+    var fitZoom = Math.min(canvas.width / s.imgW, canvas.height / s.imgH);
+    s.fitZoom = fitZoom;
+    s.zoom    = fitZoom;
+    s.panX    = (canvas.width  - s.imgW * fitZoom) / 2;
+    s.panY    = (canvas.height - s.imgH * fitZoom) / 2;
+
     var ci = new Image();
     ci.crossOrigin = 'anonymous';
-    ci.onload = function() { s.img = ci; drawView(v); };
+    ci.onload = function() {
+      s.img = ci;
+      img.style.visibility = 'hidden'; // canvas draws the image; hide the <img>
+      drawView(v);
+    };
+    ci.onerror = function() {
+      // CORS fallback: keep <img> visible, draw only skeleton on transparent canvas
+      s.img = null;
+      img.style.visibility = '';
+      drawView(v);
+    };
     ci.src = img.src;
-    if (ci.complete) { s.img = ci; drawView(v); }
+    if (ci.complete && ci.naturalWidth > 0) {
+      s.img = ci;
+      img.style.visibility = 'hidden';
+      drawView(v);
+    }
 
-    // Events
     canvas.addEventListener('mousedown',  function(e){ onDown(e,v); });
     canvas.addEventListener('mousemove',  function(e){ onMove(e,v); });
     canvas.addEventListener('mouseup',    function(e){ onUp(e,v); });
@@ -260,7 +281,7 @@ STAGE2_JS = r"""() => {
 
   function nearestLM(cx, cy, s) {
     if (!s.landmarks) return -1;
-    var SNAP = 15;   // px in canvas space
+    var SNAP = 15;
     var best = -1, bestD = Infinity;
     s.landmarks.forEach(function(lm, idx) {
       if (!lm) return;
@@ -326,15 +347,37 @@ STAGE2_JS = r"""() => {
     VS[v].panning = false;
   }
 
+  function showToast(v, msg) {
+    var s = VS[v];
+    s._toast = msg;
+    if (s._toastTimer) clearTimeout(s._toastTimer);
+    s._toastTimer = setTimeout(function() { s._toast = null; drawView(v); }, 1500);
+  }
+
   function onWheel(e, v) {
     e.preventDefault();
     var s = VS[v];
+    if (!s.canvas) return;
     var pos = canvasXY(e, s.canvas);
     var cx = pos[0], cy = pos[1];
-    var f  = e.deltaY > 0 ? 0.85 : 1.18;
-    s.panX = cx - (cx - s.panX) * f;
-    s.panY = cy - (cy - s.panY) * f;
-    s.zoom = Math.max(0.4, Math.min(8, s.zoom * f));
+    // Reduced sensitivity: 9% per tick (was 18%/15%)
+    var f = e.deltaY > 0 ? 0.91 : 1.09;
+    var minZ = s.fitZoom, maxZ = s.fitZoom * 10;
+    var newZoom = s.zoom * f;
+
+    if (newZoom <= minZ) {
+      if (s.zoom === minZ) { showToast(v, 'Zoomed out to fit'); drawView(v); return; }
+      newZoom = minZ;
+    } else if (newZoom >= maxZ) {
+      if (s.zoom === maxZ) { showToast(v, 'Maximum zoom reached'); drawView(v); return; }
+      newZoom = maxZ;
+    }
+
+    // Zoom centred on cursor: keep the image point under the cursor fixed
+    var scale = newZoom / s.zoom;
+    s.panX = cx - (cx - s.panX) * scale;
+    s.panY = cy - (cy - s.panY) * scale;
+    s.zoom = newZoom;
     drawView(v);
   }
 
@@ -370,16 +413,25 @@ STAGE2_JS = r"""() => {
   // ── Watchers ──────────────────────────────────────────────────────────────
 
   function watchView(v) {
-    // Re-init canvas when gr.Image changes its src
     var annEl = document.querySelector('#s2-ann-' + v);
     if (annEl) {
       new MutationObserver(function() {
         setTimeout(function() { setupCanvas(v); loadLmData(v); }, 250);
       }).observe(annEl, {childList:true, subtree:true,
                           attributes:true, attributeFilter:['src']});
+
+      // ResizeObserver re-triggers canvas setup when a hidden tab becomes visible
+      if (typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(function() {
+          var s = VS[v];
+          if (!s.canvas || s.canvas.width === 0) {
+            s._lastSrc = '';
+            setTimeout(function() { setupCanvas(v); }, 150);
+          }
+        }).observe(annEl);
+      }
     }
 
-    // Reload landmarks when Python updates the hidden gr.HTML
     var lmEl = document.querySelector('#s2-lm-data-' + v);
     if (lmEl) {
       new MutationObserver(function() {
@@ -394,11 +446,15 @@ STAGE2_JS = r"""() => {
       setupCanvas(v);
       loadLmData(v);
     });
-    // Re-setup on resize (canvas position may shift)
     window.addEventListener('resize', function() {
       VIEWS.forEach(function(v) {
         if (VS[v].canvas) { VS[v].canvas.remove(); VS[v].canvas = null; }
         VS[v]._lastSrc = '';
+        var host = document.querySelector('#s2-ann-' + v);
+        if (host) {
+          var im = host.querySelector('img');
+          if (im) im.style.visibility = '';
+        }
         setTimeout(function() { setupCanvas(v); }, 300);
       });
     });
@@ -483,7 +539,8 @@ def handle_extract(img_front, img_side, img_back, state: dict):
     return (state,
             base["front"], base["side"], base["back"],
             lm_html["front"], lm_html["side"], lm_html["back"],
-            status)
+            status,
+            base["front"], base["side"], base["back"])
 
 
 def handle_fit(state: dict):
@@ -544,18 +601,18 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
 
         with gr.Row():
             # ── Left: photo inputs ─────────────────────────────────────────
-            with gr.Column(scale=3):
+            with gr.Column(scale=2):
                 gr.Markdown("### Input photos")
                 gr.HTML(
                     '<p class="st2-label">Transparent PNGs from Stage 1 (or upload directly)</p>'
                 )
-                img_front = gr.Image(label="Front", type="pil", height=260)
-                img_side  = gr.Image(label="Side",  type="pil", height=260)
-                img_back  = gr.Image(label="Back",  type="pil", height=260)
+                img_front = gr.Image(label="Front", type="pil", height=160, image_mode="RGBA")
+                img_side  = gr.Image(label="Side",  type="pil", height=160, image_mode="RGBA")
+                img_back  = gr.Image(label="Back",  type="pil", height=160, image_mode="RGBA")
                 btn_extract = gr.Button("1 — Extract keypoints", variant="secondary")
 
             # ── Centre: annotated landmark views ───────────────────────────
-            with gr.Column(scale=4):
+            with gr.Column(scale=5):
                 gr.Markdown("### Landmark overlay")
                 gr.HTML(
                     '<p style="font-size:0.82rem;color:#aaa;margin:2px 0 10px">'
@@ -564,30 +621,31 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
                     "<strong>Scroll</strong> to zoom · <strong>Drag empty area</strong> to pan"
                     "</p>"
                 )
-                ann_front = gr.Image(
-                    label="Front", type="pil", height=300,
-                    show_label=True, interactive=False,
-                    elem_id="s2-ann-front",
-                )
-                ann_side  = gr.Image(
-                    label="Side",  type="pil", height=300,
-                    show_label=True, interactive=False,
-                    elem_id="s2-ann-side",
-                )
-                ann_back  = gr.Image(
-                    label="Back",  type="pil", height=300,
-                    show_label=True, interactive=False,
-                    elem_id="s2-ann-back",
-                )
-                # Hidden: Python → JS landmark data (base64 JSON in data attribute)
-                lm_html_f = gr.HTML("", visible=False, elem_id="s2-lm-data-front")
-                lm_html_s = gr.HTML("", visible=False, elem_id="s2-lm-data-side")
-                lm_html_b = gr.HTML("", visible=False, elem_id="s2-lm-data-back")
-
-                # Hidden: JS → Python drag corrections
-                lm_up_f = gr.Textbox("", visible=False, elem_id="s2-lm-up-front")
-                lm_up_s = gr.Textbox("", visible=False, elem_id="s2-lm-up-side")
-                lm_up_b = gr.Textbox("", visible=False, elem_id="s2-lm-up-back")
+                with gr.Tabs():
+                    with gr.Tab("Front"):
+                        ann_front = gr.Image(
+                            type="pil", height=520,
+                            show_label=False, interactive=False,
+                            elem_id="s2-ann-front",
+                        )
+                        lm_html_f = gr.HTML("", visible=False, elem_id="s2-lm-data-front")
+                        lm_up_f   = gr.Textbox("", visible=False, elem_id="s2-lm-up-front")
+                    with gr.Tab("Side"):
+                        ann_side = gr.Image(
+                            type="pil", height=520,
+                            show_label=False, interactive=False,
+                            elem_id="s2-ann-side",
+                        )
+                        lm_html_s = gr.HTML("", visible=False, elem_id="s2-lm-data-side")
+                        lm_up_s   = gr.Textbox("", visible=False, elem_id="s2-lm-up-side")
+                    with gr.Tab("Back"):
+                        ann_back = gr.Image(
+                            type="pil", height=520,
+                            show_label=False, interactive=False,
+                            elem_id="s2-ann-back",
+                        )
+                        lm_html_b = gr.HTML("", visible=False, elem_id="s2-lm-data-back")
+                        lm_up_b   = gr.Textbox("", visible=False, elem_id="s2-lm-up-back")
 
                 gr.HTML('<hr style="border-color:#333;margin:12px 0 8px">')
                 btn_refit = gr.Button("Re-fit with corrected landmarks", variant="secondary")
@@ -634,7 +692,8 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
             outputs=[state,
                      ann_front, ann_side, ann_back,
                      lm_html_f, lm_html_s, lm_html_b,
-                     status],
+                     status,
+                     img_front, img_side, img_back],
         )
 
         btn_fit.click(
