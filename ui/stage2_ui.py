@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import tempfile
 import numpy as np
 import gradio as gr
 from PIL import Image
@@ -143,6 +144,7 @@ STAGE2_JS = r"""() => {
       ctx.lineWidth = 2 / s.zoom;
       s.landmarks.forEach(function(lm, idx) {
         if (!lm) return;
+        if (v === 'back' && idx < 11) return; // face not visible from back
         var x = lm.x * s.imgW, y = lm.y * s.imgH;
         var isDrag = (idx === s.dragging);
         ctx.globalAlpha = Math.max(0.4, lm.visibility);
@@ -161,6 +163,7 @@ STAGE2_JS = r"""() => {
       ctx.font = '13px "Helvetica Neue",Helvetica,Arial,sans-serif';
       s.landmarks.forEach(function(lm, idx) {
         if (!lm) return;
+        if (v === 'back' && idx < 11) return; // face not visible from back
         var name = NAMES[idx];
         if (!name) return;
         var cx = lm.x * s.imgW * s.zoom + s.panX;
@@ -209,28 +212,23 @@ STAGE2_JS = r"""() => {
     if (s.canvas && img.src === s._lastSrc && s.canvas.width > 0) return;
     s._lastSrc = img.src;
 
-    var frame = host.querySelector('.image-frame') || host;
-    if (frame.style.position !== 'relative') frame.style.position = 'relative';
-
     if (s.canvas) { s.canvas.remove(); s.canvas = null; }
 
-    var fRect = frame.getBoundingClientRect();
-    var iRect = img.getBoundingClientRect();
-    if (!iRect.width || !iRect.height) return;
+    // Size canvas to the FULL component container, not just the narrow <img> rect.
+    // This gives a proper pan viewport for side-view photos with slim aspect ratios.
+    if (host.style.position !== 'relative') host.style.position = 'relative';
+    var hRect = host.getBoundingClientRect();
+    if (!hRect.width || !hRect.height) return;
 
     var canvas = document.createElement('canvas');
     canvas.className = 's2-lm-canvas';
-    canvas.width  = Math.round(iRect.width);
-    canvas.height = Math.round(iRect.height);
-    var top  = iRect.top  - fRect.top;
-    var left = iRect.left - fRect.left;
+    canvas.width  = Math.round(hRect.width);
+    canvas.height = Math.round(hRect.height);
     canvas.style.cssText = (
       'position:absolute;z-index:20;cursor:crosshair;pointer-events:auto;' +
-      'top:' + top + 'px;left:' + left + 'px;' +
-      'width:'  + iRect.width  + 'px;' +
-      'height:' + iRect.height + 'px;'
+      'top:0;left:0;width:100%;height:100%;'
     );
-    frame.appendChild(canvas);
+    host.appendChild(canvas);
 
     s.canvas = canvas;
     s.ctx    = canvas.getContext('2d');
@@ -366,7 +364,7 @@ STAGE2_JS = r"""() => {
     var newZoom = s.zoom * f;
 
     if (newZoom <= minZ) {
-      if (s.zoom === minZ) { showToast(v, 'Zoomed out to fit'); drawView(v); return; }
+      if (s.zoom === minZ) { showToast(v, 'Cannot zoom out further'); drawView(v); return; }
       newZoom = minZ;
     } else if (newZoom >= maxZ) {
       if (s.zoom === maxZ) { showToast(v, 'Maximum zoom reached'); drawView(v); return; }
@@ -440,7 +438,26 @@ STAGE2_JS = r"""() => {
     }
   }
 
+  // ── Tab-advance signal ────────────────────────────────────────────────────
+  // Python writes "advance" into #s2-advance (gr.HTML); observer clicks Stage 3 tab.
+  // Same pattern as landmark data observers — set up once in init, lives for session.
+
+  function setupAdvanceObserver() {
+    var el = document.querySelector('#s2-advance');
+    if (!el) { setTimeout(setupAdvanceObserver, 800); return; }
+    new MutationObserver(function() {
+      // Read textContent recursively — Svelte may nest content in child divs
+      var txt = (el.textContent || '').trim();
+      if (txt !== 'advance') return;
+      // Find the "3 — Classification" tab button by partial text match
+      document.querySelectorAll('button').forEach(function(b) {
+        if (b.textContent.includes('Classification')) b.click();
+      });
+    }).observe(el, {childList: true, subtree: true, characterData: true});
+  }
+
   function init() {
+    setupAdvanceObserver();
     VIEWS.forEach(function(v) {
       watchView(v);
       setupCanvas(v);
@@ -504,6 +521,37 @@ def _lm_data_html(kp: dict | None) -> str:
     return f'<span data-b64="{b64}"></span>'
 
 
+_LR_SWAP_PAIRS = [
+    (1, 4), (2, 5), (3, 6),          # eyes
+    (7, 8), (9, 10),                  # ears, mouth
+    (11, 12), (13, 14), (15, 16),     # shoulder / elbow / wrist
+    (17, 18), (19, 20), (21, 22),     # pinky / index / thumb
+    (23, 24), (25, 26), (27, 28),     # hip / knee / ankle
+    (29, 30), (31, 32),               # heel / foot
+]
+
+
+def _fix_back_view_landmarks(kp: dict) -> dict:
+    """Swap left/right landmark identities and zero face landmarks for back-view photos.
+
+    MediaPipe is trained on front-facing images, so in a back photo it labels
+    the arm on the LEFT of the image as 'R-shldr'. Swapping each L/R pair
+    restores anatomically correct labels without moving any points.
+
+    Face landmarks (0-10: nose, eyes, ears, mouth) are not visible from the
+    back; their visibility is set to 0 so they are hidden in the overlay and
+    ignored in fitting.
+    """
+    if not kp or not kp.get("detected"):
+        return kp
+    lms = [dict(lm) for lm in kp["landmarks"]]
+    for l_idx, r_idx in _LR_SWAP_PAIRS:
+        lms[l_idx], lms[r_idx] = lms[r_idx], lms[l_idx]
+    for i in range(11):          # indices 0–10 are face landmarks
+        lms[i]["visibility"] = 0.0
+    return {**kp, "landmarks": lms}
+
+
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 def handle_extract(img_front, img_side, img_back, state: dict):
@@ -519,6 +567,8 @@ def handle_extract(img_front, img_side, img_back, state: dict):
             lm_html[view] = ""
             continue
         kp = extract_keypoints(img)
+        if view == "back":
+            kp = _fix_back_view_landmarks(kp)
         state[f"kp_{view}"] = kp
         base[view]    = _base_photo(img)
         lm_html[view] = _lm_data_html(kp)
@@ -527,14 +577,17 @@ def handle_extract(img_front, img_side, img_back, state: dict):
     if img_front is not None:
         state["img_w"], state["img_h"] = img_front.size
 
-    detected = sum(
-        1 for v in ["front", "side", "back"]
+    required_ok = sum(
+        1 for v in ["front", "side"]
         if state.get(f"kp_{v}") and state[f"kp_{v}"].get("detected")
     )
-    status = (f"Keypoints extracted — {detected}/3 views detected. "
-              "Drag any landmark dot to correct its position."
-              if detected > 0 else
-              "No person detected in any photo. Check photo quality.")
+    back_ok = bool(state.get("kp_back") and state["kp_back"].get("detected"))
+    if required_ok == 0:
+        status = "No person detected in any photo. Check photo quality."
+    else:
+        back_note = " + back" if back_ok else (" (back: not detected)" if state.get("img_back") else "")
+        status = (f"Keypoints extracted — {required_ok}/2 required views detected{back_note}. "
+                  "Drag any landmark dot to correct its position.")
 
     return (state,
             base["front"], base["side"], base["back"],
@@ -592,9 +645,27 @@ def handle_confirm(state: dict):
     return state, f"✓ Body shape confirmed. β = {[round(b, 3) for b in beta]}"
 
 
+def handle_download(state: dict):
+    beta = state.get("beta")
+    if beta is None:
+        return gr.update(visible=False)
+    measurements = beta_to_measurements(np.array(beta, dtype=np.float32))
+    payload = {
+        "beta_parameters": {f"beta_{i}": round(v, 6) for i, v in enumerate(beta)},
+        "measurements_cm": measurements,
+    }
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, prefix="seetwin_body_"
+    )
+    json.dump(payload, tmp, indent=2)
+    tmp.close()
+    return gr.update(value=tmp.name, visible=True)
+
+
 # ── Tab builder ───────────────────────────────────────────────────────────────
 
-def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
+def build_stage2_tab(stage1_state: gr.State | None = None,
+                     main_tabs: gr.Tabs | None = None) -> gr.Tab:
     with gr.Tab("2 — Body shape") as tab:
         state = gr.State(_empty_state())
         gr.HTML(_STYLE)
@@ -604,11 +675,12 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
             with gr.Column(scale=2):
                 gr.Markdown("### Input photos")
                 gr.HTML(
-                    '<p class="st2-label">Transparent PNGs from Stage 1 (or upload directly)</p>'
+                    '<p class="st2-label">Transparent PNGs from Stage 1 (or upload directly) '
+                    '· Front + Side required · Back optional</p>'
                 )
                 img_front = gr.Image(label="Front", type="pil", height=160, image_mode="RGBA")
                 img_side  = gr.Image(label="Side",  type="pil", height=160, image_mode="RGBA")
-                img_back  = gr.Image(label="Back",  type="pil", height=160, image_mode="RGBA")
+                img_back  = gr.Image(label="Back (optional)", type="pil", height=160, image_mode="RGBA")
                 btn_extract = gr.Button("1 — Extract keypoints", variant="secondary")
 
             # ── Centre: annotated landmark views ───────────────────────────
@@ -616,7 +688,9 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
                 gr.Markdown("### Landmark overlay")
                 gr.HTML(
                     '<p style="font-size:0.82rem;color:#aaa;margin:2px 0 10px">'
-                    "Green = left side · Red = right side · Yellow = landmark<br>"
+                    '<span style="color:#00C878">Green = left side</span> · '
+                    '<span style="color:#DC5050">Red = right side</span> · '
+                    '<span style="color:#FFDC32">Yellow = landmark</span><br>'
                     "<strong>Drag</strong> any dot to correct its position · "
                     "<strong>Scroll</strong> to zoom · <strong>Drag empty area</strong> to pan"
                     "</p>"
@@ -647,8 +721,6 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
                         lm_html_b = gr.HTML("", visible=False, elem_id="s2-lm-data-back")
                         lm_up_b   = gr.Textbox("", visible=False, elem_id="s2-lm-up-back")
 
-                gr.HTML('<hr style="border-color:#333;margin:12px 0 8px">')
-                btn_refit = gr.Button("Re-fit with corrected landmarks", variant="secondary")
 
             # ── Right: fit controls + measurements ─────────────────────────
             with gr.Column(scale=3):
@@ -664,11 +736,8 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
                     gr.HTML(
                         '<p class="st2-beta-note">'
                         "β controls the 3D SMPL-X body shape — measurements update live.<br><br>"
-                        "Landmark dot positions come from MediaPipe detection and do "
-                        "<em>not</em> change with β. "
-                        "Drag landmark dots on the overlay (centre panel) to correct "
-                        "wrong detections, then click "
-                        "<strong>Re-fit with corrected landmarks</strong>."
+                        "Drag landmark dots on the overlay to correct wrong detections, "
+                        "then click <strong>2 — Fit body shape</strong> again to re-fit."
                         "</p>"
                     )
                     beta_sliders = [
@@ -678,10 +747,16 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
                     ]
 
                 gr.HTML('<hr style="border-color:#444;margin:12px 0">')
+                btn_download = gr.Button("⬇ Download betas & measurements", variant="secondary")
+                download_file = gr.File(visible=False, label="Download")
+                gr.HTML('<div style="margin:6px 0"></div>')
                 btn_confirm = gr.Button("3 — Confirm & continue", variant="primary")
 
+        # Hidden signal: Python sets this to trigger JS tab advance
+        adv_html = gr.HTML("", visible=False, elem_id="s2-advance")
+
         status = gr.Markdown(
-            "Upload photos (or load from Stage 1 export), then click **Extract keypoints**."
+            "Upload front + side photos (back is optional), then click **Extract keypoints**."
         )
 
         # ── Wiring ────────────────────────────────────────────────────────
@@ -697,12 +772,6 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
         )
 
         btn_fit.click(
-            fn=handle_fit,
-            inputs=[state],
-            outputs=[state, meas_html, beta_group] + beta_sliders,
-        )
-
-        btn_refit.click(
             fn=handle_fit,
             inputs=[state],
             outputs=[state, meas_html, beta_group] + beta_sliders,
@@ -733,10 +802,26 @@ def build_stage2_tab(stage1_state: gr.State | None = None) -> gr.Tab:
                 outputs=[state, meas_html],
             )
 
-        btn_confirm.click(
-            fn=handle_confirm,
+        btn_download.click(
+            fn=handle_download,
             inputs=[state],
-            outputs=[state, status],
+            outputs=[download_file],
+        )
+
+        def _confirm_and_advance(state):
+            s, msg = handle_confirm(state)
+            if main_tabs is not None and s.get("beta") is not None:
+                return s, msg, gr.update(selected="stage3")
+            return s, msg, gr.update()
+
+        _confirm_outputs = [state, status]
+        if main_tabs is not None:
+            _confirm_outputs.append(main_tabs)
+
+        btn_confirm.click(
+            fn=_confirm_and_advance,
+            inputs=[state],
+            outputs=_confirm_outputs,
         )
 
     return tab

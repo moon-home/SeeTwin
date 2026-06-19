@@ -92,6 +92,7 @@ Stage 9 — Pose Analysis (Kimodo)
 
 **No mesh output at this stage** — parameters are passed to Stages 3 and 5
 
+
 ---
 
 ### Stage 3 — Classification & Confirmation

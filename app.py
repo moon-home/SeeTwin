@@ -41,10 +41,10 @@ def build_app(device: str = "cpu") -> gr.Blocks:
             f"Running on **{device.upper()}**"
         )
 
-        with gr.Tabs():
+        with gr.Tabs() as main_tabs:
             build_stage1_tab(device=device)
-            build_stage2_tab()
-            with gr.Tab("3 — Classification", interactive=False):
+            build_stage2_tab(main_tabs=main_tabs)
+            with gr.Tab("3 — Classification", id="stage3"):
                 gr.Markdown("_Coming soon_")
             with gr.Tab("4 — Texture extraction", interactive=False):
                 gr.Markdown("_Coming soon_")
