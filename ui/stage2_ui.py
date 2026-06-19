@@ -449,9 +449,8 @@ STAGE2_JS = r"""() => {
       // Read textContent recursively — Svelte may nest content in child divs
       var txt = (el.textContent || '').trim();
       if (txt !== 'advance') return;
-      // Find the "3 — Classification" tab button by partial text match
       document.querySelectorAll('button').forEach(function(b) {
-        if (b.textContent.includes('Classification')) b.click();
+        if (b.textContent.includes('Parts manifest')) b.click();
       });
     }).observe(el, {childList: true, subtree: true, characterData: true});
   }
@@ -665,7 +664,7 @@ def handle_download(state: dict):
 # ── Tab builder ───────────────────────────────────────────────────────────────
 
 def build_stage2_tab(stage1_state: gr.State | None = None,
-                     main_tabs: gr.Tabs | None = None) -> gr.Tab:
+                     main_tabs: gr.Tabs | None = None) -> tuple[gr.Tab, gr.State]:
     with gr.Tab("2 — Body shape") as tab:
         state = gr.State(_empty_state())
         gr.HTML(_STYLE)
@@ -824,4 +823,4 @@ def build_stage2_tab(stage1_state: gr.State | None = None,
             outputs=_confirm_outputs,
         )
 
-    return tab
+    return tab, state

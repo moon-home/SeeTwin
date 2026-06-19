@@ -25,7 +25,11 @@ numpy>=1.24.0
 # ── Utilities ────────────────────────────────────────────────────────────────
 requests>=2.31.0       # model download helper
 
-# ── Stages 2–6 (added as stages are built) ───────────────────────────────────
+# ── Stage 3 — Classification ─────────────────────────────────────────────────
+open-clip-torch>=3.3.0  # CLIP zero-shot classifier (ViT-B-32, ~350 MB download on first run)
+ftfy>=6.0.0             # text normalisation required by open_clip tokenizer
+
+# ── Stages 4–6 (added as stages are built) ───────────────────────────────────
 # smplx                # pip install smplx   (after registering at mpi-inf.mpg.de)
 # segment-anything-2   # pip install sam2    (Meta SAM2)
 # diffusers            # pip install diffusers accelerate  (SD inpainting)

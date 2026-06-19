@@ -30,6 +30,7 @@ def parse_args():
 def build_app(device: str = "cpu") -> gr.Blocks:
     from ui.stage1_ui import build_stage1_tab, STAGE1_JS
     from ui.stage2_ui import build_stage2_tab, STAGE2_JS
+    from ui.stage3_ui import build_stage3_tab
 
     # Both JS modules are arrow-function strings; wrap in one combined call
     COMBINED_JS = f"() => {{ ({STAGE1_JS})(); ({STAGE2_JS})(); }}"
@@ -43,9 +44,8 @@ def build_app(device: str = "cpu") -> gr.Blocks:
 
         with gr.Tabs() as main_tabs:
             build_stage1_tab(device=device)
-            build_stage2_tab(main_tabs=main_tabs)
-            with gr.Tab("3 — Classification", id="stage3"):
-                gr.Markdown("_Coming soon_")
+            _, s2_state = build_stage2_tab(main_tabs=main_tabs)
+            build_stage3_tab(stage2_state=s2_state, main_tabs=main_tabs)
             with gr.Tab("4 — Texture extraction", interactive=False):
                 gr.Markdown("_Coming soon_")
             with gr.Tab("5 — Assembly", interactive=False):
